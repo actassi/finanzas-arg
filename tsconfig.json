@@ -19,8 +19,10 @@
         "name": "next"
       }
     ],
+
+    "baseUrl": ".",             // 🔹 AGREGAR ESTO
     "paths": {
-      "@/*": ["./*"]
+      "@/*": ["*"]              // o ["./*"], las dos andan con baseUrl="."
     }
   },
   "include": [
