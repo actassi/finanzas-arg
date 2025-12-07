@@ -5,9 +5,10 @@ import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import { applyMerchantRules } from '@/lib/classification';
 import type { MerchantRule } from '@/types/db';
+import { parseStatementPdf } from '@/lib/pdf/statementParser';
 
 /**
- * Alta de una sola transacción (pantalla "Nueva transacción")
+ * Alta de una sola transacción (pantalla "Nueva transacción").
  */
 export async function createTransaction(formData: FormData) {
   const supabase = await createClient();
@@ -33,7 +34,7 @@ export async function createTransaction(formData: FormData) {
   const amountStr = formData.get('amount')?.toString().trim() || '0';
   const amount = Number(amountStr.replace(',', '.'));
 
-  if (!accountId || !date || !descriptionRaw || !amount) {
+  if (!accountId || !date || !descriptionRaw || Number.isNaN(amount)) {
     return;
   }
 
@@ -57,12 +58,12 @@ export async function createTransaction(formData: FormData) {
 }
 
 /**
- * Importación de CSV de movimientos
+ * Importación de CSV de movimientos.
  *
- * Espera un form con:
+ * Espera:
  * - file: archivo CSV
  * - account_id: cuenta destino
- * - type: tipo de transacción por defecto (expense, income, etc.)
+ * - type: tipo por defecto (expense, income, etc.)
  */
 export async function importTransactionsFromCsv(formData: FormData) {
   const supabase = await createClient();
@@ -84,51 +85,58 @@ export async function importTransactionsFromCsv(formData: FormData) {
     redirect('/protected/transactions/import?imported=0');
   }
 
-  // 1) Leemos el archivo completo como texto
   const text = await file.text();
 
-  // 2) Traemos las reglas del usuario para clasificar
   const { data: rulesData, error: rulesError } = await supabase
     .from('merchant_rules')
     .select(
-      'id, user_id, pattern, match_type, merchant_name, category_id, priority, created_at'
+      'id, user_id, pattern, match_type, merchant_name, category_id, priority, created_at',
     )
     .eq('user_id', user.id)
     .order('priority', { ascending: true });
 
   if (rulesError) {
-    console.error('Error leyendo reglas para importación:', rulesError);
+    console.error('Error leyendo reglas para importación CSV:', rulesError);
   }
 
   const rules = (rulesData ?? []) as MerchantRule[];
 
-  // 3) Parseamos el CSV
-  type ParsedRow = {
+  type CsvRow = {
     date: string;
     description: string;
     amount: number;
   };
 
-  const rows: ParsedRow[] = [];
+  const rows: CsvRow[] = [];
 
-  const lines = text
+  const rawLines = text
     .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+    .filter((l) => l.trim().length > 0);
+
+  const stripOuterQuotes = (line: string) => {
+    let s = line.trim();
+    s = s.replace(/^\uFEFF/, ''); // BOM
+    if (s.startsWith('"') && s.endsWith('"')) {
+      s = s.slice(1, -1);
+    }
+    return s;
+  };
+
+  const lines = rawLines.map(stripOuterQuotes);
 
   if (lines.length <= 1) {
     console.error('CSV sin contenido suficiente');
     redirect('/protected/transactions/import?imported=0');
   }
 
-  // Detectamos delimitador (muy simple)
+  const headerLine = lines[0];
+
   const detectDelimiter = (line: string) => {
     const semi = (line.match(/;/g) || []).length;
     const comma = (line.match(/,/g) || []).length;
     return semi > comma ? ';' : ',';
   };
 
-  const headerLine = lines[0];
   const delimiter = detectDelimiter(headerLine);
 
   const headers = headerLine
@@ -137,15 +145,27 @@ export async function importTransactionsFromCsv(formData: FormData) {
 
   const findIndex = (...candidates: string[]) =>
     headers.findIndex((h) =>
-      candidates.some((c) => h.includes(c.toLowerCase()))
+      candidates.some((c) => h.includes(c.toLowerCase())),
     );
 
   const dateIdx = findIndex('fecha', 'date', 'fecha operación', 'fecha op');
-  const descIdx = findIndex('descripción', 'descripcion', 'detalle', 'description');
-  const amountIdx = findIndex('importe', 'monto', 'amount', 'importe original');
+  const descIdx = findIndex(
+    'descripción',
+    'descripcion',
+    'detalle',
+    'description',
+  );
+  const amountIdx = findIndex(
+    'importe',
+    'monto',
+    'amount',
+    'importe original',
+  );
 
   if (dateIdx === -1 || descIdx === -1 || amountIdx === -1) {
-    console.error('No se pudieron detectar columnas fecha/descr/monto en el CSV');
+    console.error(
+      'No se pudieron detectar columnas fecha/descr/monto en el CSV',
+    );
     redirect('/protected/transactions/import?imported=0');
   }
 
@@ -153,10 +173,8 @@ export async function importTransactionsFromCsv(formData: FormData) {
     const v = value.trim();
     if (!v) return null;
 
-    // Formato YYYY-MM-DD
     if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
 
-    // Formato DD/MM/AAAA o DD-MM-AAAA (muy típico banco AR)
     const m = v.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})$/);
     if (m) {
       let [_, dd, mm, yy] = m;
@@ -168,7 +186,6 @@ export async function importTransactionsFromCsv(formData: FormData) {
       return `${yy}-${month}-${day}`;
     }
 
-    // Intento final con Date.parse
     const d = new Date(v);
     if (!isNaN(d.getTime())) {
       return d.toISOString().slice(0, 10);
@@ -181,15 +198,10 @@ export async function importTransactionsFromCsv(formData: FormData) {
     let s = raw.trim();
     if (!s) return 0;
 
-    // Sacamos separadores de miles típicos y dejamos punto decimal
-    // Ej: "4.681,16" -> "4681.16"
     s = s.replace(/\./g, '').replace(',', '.');
-
-    // Eliminamos símbolos de moneda si los hubiera
     s = s.replace(/[^\d\.-]/g, '');
-
     const n = Number(s);
-    return isNaN(n) ? 0 : n;
+    return Number.isNaN(n) ? 0 : n;
   };
 
   for (let i = 1; i < lines.length; i++) {
@@ -203,8 +215,7 @@ export async function importTransactionsFromCsv(formData: FormData) {
     const isoDate = parseArgDateToIso(String(rawDate));
     const amount = parseAmount(String(rawAmount));
 
-    if (!isoDate || !rawDesc || !amount) {
-      // Podríamos llevar conteo de filas ignoradas
+    if (!isoDate || !rawDesc || Number.isNaN(amount)) {
       continue;
     }
 
@@ -220,7 +231,6 @@ export async function importTransactionsFromCsv(formData: FormData) {
     redirect('/protected/transactions/import?imported=0');
   }
 
-  // 4) Clasificamos e insertamos
   const inserts = rows.map((row) => {
     const klass = applyMerchantRules(row.description, rules);
 
@@ -241,7 +251,7 @@ export async function importTransactionsFromCsv(formData: FormData) {
     .insert(inserts);
 
   if (insertError) {
-    console.error('Error insertando transacciones importadas:', insertError);
+    console.error('Error insertando transacciones (CSV):', insertError);
     redirect('/protected/transactions/import?imported=0');
   }
 
@@ -249,4 +259,90 @@ export async function importTransactionsFromCsv(formData: FormData) {
 
   revalidatePath('/protected/transactions/import');
   redirect(`/protected/transactions/import?imported=${importedCount}`);
+}
+
+/**
+ * Importación desde PDF usando el parser principal de resúmenes.
+ *
+ * Espera:
+ * - file: PDF del resumen
+ * - account_id: cuenta destino
+ * - type: tipo por defecto (expense, income, etc.)
+ */
+export async function importTransactionsFromPdf(formData: FormData) {
+  const supabase = await createClient();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    redirect('/login');
+  }
+
+  const accountId = formData.get('account_id')?.toString().trim() || null;
+  const type = formData.get('type')?.toString().trim() || 'expense';
+  const file = formData.get('file') as File | null;
+
+  if (!accountId || !file) {
+    console.error('Faltan account_id o archivo PDF');
+    redirect('/protected/transactions/import-pdf?imported=0');
+  }
+
+  // 1) File -> ArrayBuffer -> parser principal (PDF -> líneas)
+  const arrayBuffer = await file.arrayBuffer();
+  const rows = await parseStatementPdf(arrayBuffer);
+
+  if (!rows.length) {
+    console.error('No se obtuvieron filas válidas del PDF');
+    redirect('/protected/transactions/import-pdf?imported=0');
+  }
+
+  // 2) Traer reglas de comercio del usuario
+  const { data: rulesData, error: rulesError } = await supabase
+    .from('merchant_rules')
+    .select(
+      'id, user_id, pattern, match_type, merchant_name, category_id, priority, created_at',
+    )
+    .eq('user_id', user.id)
+    .order('priority', { ascending: true });
+
+  if (rulesError) {
+    console.error('Error leyendo reglas para importación PDF:', rulesError);
+  }
+
+  const rules = (rulesData ?? []) as MerchantRule[];
+
+  // 3) Clasificar e insertar
+  const inserts = rows.map((row) => {
+    const klass = applyMerchantRules(row.description, rules);
+
+    return {
+      user_id: user.id,
+      account_id: accountId,
+      date: row.date, // ya viene en ISO (YYYY-MM-DD) desde el parser
+      description_raw: row.description,
+      merchant_name: klass.merchantName,
+      category_id: klass.categoryId || null,
+      amount: row.amount,
+      type,
+    };
+  });
+
+  const { error: insertError } = await supabase
+    .from('transactions')
+    .insert(inserts);
+
+  if (insertError) {
+    console.error(
+      'Error insertando transacciones importadas desde PDF:',
+      insertError,
+    );
+    redirect('/protected/transactions/import-pdf?imported=0');
+  }
+
+  const importedCount = inserts.length;
+
+  revalidatePath('/protected/transactions/import-pdf');
+  redirect(`/protected/transactions/import-pdf?imported=${importedCount}`);
 }
