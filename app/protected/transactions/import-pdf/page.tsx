@@ -1,38 +1,14 @@
-import { redirect } from 'next/navigation';
-import { createClient } from '@/lib/supabase/server';
-import type { Account } from '@/types/db';
-import ImportPdfClient from './ImportPdfClient';
+import { Suspense } from "react";
+import ImportPdfContent from "./ImportPdfContent";
 
-export default async function ImportPdfPage({
-  searchParams,
-}: {
+export const runtime = "nodejs";
+
+export default function ImportPdfPage(props: {
   searchParams: Promise<{ imported?: string }>;
 }) {
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    redirect('/login');
-  }
-
-  const userId = user.id;
-  const sp = await searchParams;
-  const imported = sp.imported ? Number(sp.imported) || 0 : 0;
-
-  const { data: accountsData, error: accountsError } = await supabase
-    .from('accounts')
-    .select('id, name, type, institution, currency')
-    .eq('user_id', userId)
-    .order('name', { ascending: true });
-
-  if (accountsError) {
-    console.error(accountsError);
-  }
-
-  const accounts = (accountsData ?? []) as Account[];
-
-  return <ImportPdfClient accounts={accounts} imported={imported} />;
+  return (
+    <Suspense fallback={<div className="p-8">Cargando...</div>}>
+      <ImportPdfContent searchParams={props.searchParams} />
+    </Suspense>
+  );
 }

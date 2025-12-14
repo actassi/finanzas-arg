@@ -1,145 +1,192 @@
 // lib/pdf/statementParser.ts
-import pdfParse from 'pdf-parse';
+import "server-only";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-export interface ParsedStatementRow {
-  date: string;        // Fecha en formato ISO: YYYY-MM-DD
-  description: string; // Descripción cruda del movimiento
-  amount: number;      // Monto numérico (positivo = débito, negativo = crédito)
+export type Tx = {
+  date: string; // ISO yyyy-mm-dd
+  description: string; // solo alfabética (normalizada)
+  receipt: string | null; // comprobante
+  installmentNumber: number | null;
+  installmentsTotal: number | null;
+  amount: number; // ARS
+};
+
+type Item = { str: string; x: number; y: number };
+
+// Acepta 25-10-25 o 25.10.25
+const DATE_RE = /^\d{2}[.-]\d{2}[.-]\d{2}$/;
+const AMOUNT_RE = /^-?\d{1,3}(?:\.\d{3})*,\d{2}$/;
+const INST_RE = /^(\d{2})\/(\d{2})$/;
+
+function parseDateDDMMYY(s: string): string {
+  const norm = s.replace(/\./g, "-");
+  const [dd, mm, yy] = norm.split("-").map(Number);
+  const yyyy = 2000 + yy;
+  return new Date(Date.UTC(yyyy, mm - 1, dd)).toISOString().slice(0, 10);
 }
 
-/**
- * Parser principal para resúmenes bancarios / tarjetas.
- * Recibe el ArrayBuffer del PDF (File.arrayBuffer()).
- */
-export async function parseStatementPdf(
-  fileBuffer: ArrayBuffer
-): Promise<ParsedStatementRow[]> {
-  // pdf-parse v1 trabaja con Buffer de Node
-  const buffer = Buffer.from(fileBuffer);
-
-  const result = await pdfParse(buffer);
-  const rawText = result.text ?? '';
-
-  // Normalizamos saltos de línea por las dudas
-  const text = rawText.replace(/\r\n/g, '\n');
-
-  const rows = parseFromText(text);
-
-  // Log de depuración (lo podés comentar cuando esté estable)
-  console.log('[PDF parser] filas encontradas:', rows.length);
-  console.log('[PDF parser] primeras filas:', rows.slice(0, 5));
-
-  return rows;
+function parseArs(s: string): number {
+  return Number(s.replace(/\./g, "").replace(",", "."));
 }
 
-/**
- * Parser “por tramos de fecha”:
- *  - Busca todas las apariciones de una fecha corta DD.MM.AA o DD-MM-AA
- *  - Para cada fecha, toma el fragmento de texto hasta la siguiente fecha
- *  - Dentro de ese tramo:
- *      * quita espacios sobrantes
- *      * usa la ÚLTIMA “palabra numérica” como importe
- *      * el resto es la descripción
- */
-function parseFromText(text: string): ParsedStatementRow[] {
-  const rows: ParsedStatementRow[] = [];
+function normalizeDescription(raw: string): string {
+  return raw
+    .replace(/[*]/g, " ")
+    .replace(/[0-9]/g, " ")
+    .replace(/[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s&]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  const dateRegex = /(\d{2}[.\-]\d{2}[.\-]\d{2})/g;
-  const matches = Array.from(text.matchAll(dateRegex));
+function groupByLine(items: Item[], yTol = 2): Item[][] {
+  const bins = new Map<number, Item[]>();
+  for (const it of items) {
+    const key = Math.round(it.y / yTol);
+    const arr = bins.get(key) ?? [];
+    arr.push(it);
+    bins.set(key, arr);
+  }
+  return [...bins.values()].map((line) => line.sort((a, b) => a.x - b.x));
+}
 
-  for (let i = 0; i < matches.length; i++) {
-    const match = matches[i];
-    const start = match.index ?? 0;
-    const end =
-      i + 1 < matches.length
-        ? matches[i + 1].index ?? text.length
-        : text.length;
+function detectColumnBounds(items: Item[]) {
+  const xOf = (label: string) => {
+    const up = label.toUpperCase();
+    const hits = items.filter((i) => i.str.toUpperCase() === up);
+    hits.sort((a, b) => b.y - a.y);
+    return hits[0]?.x ?? null;
+  };
 
-    const chunk = text.slice(start, end);
+  const xCuota = xOf("CUOTA");
+  const xComp = xOf("COMPROBANTE");
+  const xPesos = xOf("PESOS");
+  const xDol = xOf("DÓLARES") ?? xOf("DOLARES");
 
-    // Compactamos espacios
-    const line = chunk.replace(/\s+/g, ' ').trim();
-    const dateStr = match[1];
+  const _xCuota = xCuota ?? 320;
+  const _xComp = xComp ?? 365;
+  const _xPesos = xPesos ?? 467;
+  const _xDol = xDol ?? 542;
 
-    const isoDate = parseShortDateToIso(dateStr);
-    if (!isoDate) continue;
+  const bDescToCuota = _xCuota - 5;
+  const bCuotaToComp = (_xCuota + _xComp) / 2;
+  const bCompToPesos = (_xComp + _xPesos) / 2;
+  const bPesosToDol = (_xPesos + _xDol) / 2;
 
-    // Restante después de la fecha
-    const rest = line.slice(match[0].length).trim();
-    if (!rest) continue;
+  return {
+    dateMaxX: 70,
+    refMinX: 70,
+    refMaxX: 85,
+    descMinX: 85,
+    descMaxX: bDescToCuota,
+    cuotaMinX: bDescToCuota,
+    cuotaMaxX: bCuotaToComp,
+    compMinX: bCuotaToComp,
+    compMaxX: bCompToPesos,
+    pesosMinX: bCompToPesos,
+    pesosMaxX: bPesosToDol,
+  };
+}
 
-    // Filtramos bloques claramente de totales / encabezados
-    if (
-      /(TOTAL\s|SALDO ANTERIOR|PAGO ANTERIOR|L[ÍI]MITE|VENCIMIENTO)/i.test(
-        rest
-      )
-    ) {
-      continue;
+let pdfjsPromise: Promise<any> | null = null;
+
+async function getPdfJs() {
+  if (!pdfjsPromise) {
+    pdfjsPromise = (async () => {
+      const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+
+      // Worker importable por Node (ESM): file://... (evita el "[project]" de Turbopack)
+      const workerPath = path.join(
+        process.cwd(),
+        "node_modules",
+        "pdfjs-dist",
+        "legacy",
+        "build",
+        "pdf.worker.mjs"
+      );
+      pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).toString();
+
+      return pdfjsLib;
+    })();
+  }
+  return pdfjsPromise;
+}
+
+export async function parseVisaPdf(buffer: Buffer): Promise<Tx[]> {
+  const pdfjsLib = await getPdfJs();
+
+  const loadingTask = pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    disableWorker: true,
+  });
+
+  const pdf = await loadingTask.promise;
+  const out: Tx[] = [];
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+
+    const items: Item[] = (tc.items as any[])
+      .map((it) => {
+        const t = it.transform; // [a,b,c,d,e,f] => e=x, f=y
+        return { str: String(it.str).trim(), x: t[4], y: t[5] };
+      })
+      .filter((i) => i.str.length > 0);
+
+    const bounds = detectColumnBounds(items);
+    const lines = groupByLine(items, 2);
+
+    for (const line of lines) {
+      const dateTok = line.find((t) => t.x < bounds.dateMaxX && DATE_RE.test(t.str))?.str;
+      if (!dateTok) continue;
+
+      const amountTok = line.find(
+        (t) => t.x >= bounds.pesosMinX && t.x < bounds.pesosMaxX && AMOUNT_RE.test(t.str)
+      )?.str;
+      if (!amountTok) continue;
+
+      const descRaw = line
+        .filter((t) => t.x >= bounds.descMinX && t.x < bounds.descMaxX)
+        .map((t) => t.str)
+        .join(" ")
+        .trim();
+
+      const cuotaRaw = line
+        .filter((t) => t.x >= bounds.cuotaMinX && t.x < bounds.cuotaMaxX)
+        .map((t) => t.str)
+        .join(" ")
+        .trim();
+
+      const compRaw = line
+        .filter((t) => t.x >= bounds.compMinX && t.x < bounds.compMaxX)
+        .map((t) => t.str)
+        .join(" ")
+        .trim();
+
+      let installmentNumber: number | null = null;
+      let installmentsTotal: number | null = null;
+      const m = cuotaRaw.match(INST_RE);
+      if (m) {
+        installmentNumber = Number(m[1]);
+        installmentsTotal = Number(m[2]);
+      }
+
+      out.push({
+        date: parseDateDDMMYY(dateTok),
+        description: normalizeDescription(descRaw),
+        receipt: compRaw ? compRaw.replace(/\D/g, "") : null,
+        installmentNumber,
+        installmentsTotal,
+        amount: parseArs(amountTok),
+      });
     }
-
-    // Último bloque numérico como importe.
-    // Ejemplos que matchea:
-    //  - 17.272,33
-    //  - -1.289.017,13
-    //  - 17272,33
-    //  - 20.000
-    const numMatch = rest.match(
-      /(-?\d[\d\.\,]*)(?:\s*[A-Z$]{0,5})?\s*$/
-    );
-    if (!numMatch) continue;
-
-    const amountToken = numMatch[1];
-    const amount = parseAmount(amountToken);
-    if (Number.isNaN(amount)) continue;
-
-    // Descripción: todo lo anterior al bloque numérico final
-    const description = rest
-      .slice(0, rest.length - numMatch[0].length)
-      .trim();
-
-    // Debe contener al menos una letra (evita capturar solo números sueltos)
-    if (!/[A-Za-zÁÉÍÓÚÑ]/.test(description)) continue;
-
-    rows.push({
-      date: isoDate,
-      description,
-      amount,
-    });
   }
 
-  return rows;
+  return out;
 }
 
-/**
- * Convierte "DD.MM.AA" o "DD-MM-AA" en "YYYY-MM-DD".
- */
-function parseShortDateToIso(dateStr: string): string | null {
-  const m = dateStr.match(/^(\d{2})[.\-](\d{2})[.\-](\d{2})$/);
-  if (!m) return null;
-
-  const [, dd, mm, yy] = m;
-
-  const yearShort = Number(yy);
-  const fullYear = yearShort >= 70 ? 1900 + yearShort : 2000 + yearShort;
-
-  return `${fullYear}-${mm}-${dd}`;
-}
-
-/**
- * Convierte cosas como:
- *  - "14.590,00"   -> 14590
- *  - "1.333,33C"   -> 1333.33
- *  - "-2.500,00D"  -> -2500
- *  - "20.000"      -> 20000
- */
-function parseAmount(token: string): number {
-  let s = token.trim();
-  if (!s) return Number.NaN;
-
-  // Nos quedamos sólo con dígitos, puntos, comas y signo
-  s = s.replace(/[^\d,\.\-]/g, '');
-  // Quitamos separadores de miles y usamos punto decimal
-  s = s.replace(/\./g, '').replace(',', '.');
-
-  return Number.parseFloat(s);
+// Alias para mantener compatibilidad con tu código existente
+export async function parseStatementPdf(buffer: Buffer): Promise<Tx[]> {
+  return parseVisaPdf(buffer);
 }
