@@ -77,6 +77,14 @@ function applyMerchantRules(
   return { merchant_name: null, category_id: null, matched_rule_id: null };
 }
 
+function cleanTextOrNull(v: unknown): string | null {
+  const s = String(v ?? '').trim();
+  return s ? s : null;
+}
+
+/**
+ * IMPORT PDF
+ */
 export async function importTransactionsFromPdf(formData: FormData) {
   const supabase = await createClient();
 
@@ -89,7 +97,7 @@ export async function importTransactionsFromPdf(formData: FormData) {
     console.error(userError);
     throw new Error('No se pudo validar la sesión.');
   }
-  if (!user) redirect('/login');
+  if (!user) redirect('/auth/login');
 
   const accountId = String(formData.get('account_id') ?? '').trim();
   const fallbackType = String(formData.get('type') ?? 'expense').trim() as TransactionType;
@@ -123,15 +131,9 @@ export async function importTransactionsFromPdf(formData: FormData) {
 
   const importBatchId = crypto.randomUUID();
 
-  // IMPORTANTE:
-  // Esto asume que ya agregaste estas columnas a `transactions`:
-  // - receipt (text)
-  // - installment_number (int)
-  // - installments_total (int)
   const inserts = rows.map((r) => {
     const type = normalizeType(r.description, fallbackType);
 
-    // Para pagos, por defecto no categorizamos (opcional). Si querés categorizarlos, remové este if.
     const { merchant_name, category_id } =
       type === 'payment'
         ? { merchant_name: null, category_id: null, matched_rule_id: null }
@@ -142,25 +144,21 @@ export async function importTransactionsFromPdf(formData: FormData) {
     return {
       user_id: user.id,
       account_id: accountId,
-      date: r.date,                   // YYYY-MM-DD
-      description_raw: r.description,  // solo alfabético
+      date: r.date, // YYYY-MM-DD
+      description_raw: r.description, // solo alfabético
       merchant_name: finalMerchantName,
       category_id,
-      amount: signedAmount(r.amount),  // siempre positivo
+      amount: signedAmount(r.amount), // siempre positivo
       type,
       import_batch_id: importBatchId,
 
-      // Columnas separadas
       receipt: r.receipt,
       installment_number: r.installmentNumber,
       installments_total: r.installmentsTotal,
     };
   });
 
-  const { error: insErr, data: inserted } = await supabase
-    .from('transactions')
-    .insert(inserts)
-    .select('id');
+  const { error: insErr, data: inserted } = await supabase.from('transactions').insert(inserts).select('id');
 
   if (insErr) {
     console.error('Supabase insert error:', insErr);
@@ -172,4 +170,98 @@ export async function importTransactionsFromPdf(formData: FormData) {
 
   const importedCount = inserted?.length ?? inserts.length;
   redirect(`/protected/transactions/import-pdf?imported=${importedCount}`);
+}
+
+export async function updateTransactionInline(input: {
+  txId: string;
+  merchantName?: string | null;
+  categoryId?: string | null;
+  applyToSimilar?: boolean;
+}) {
+  const supabase = await createClient();
+
+  const {
+    data: { user },
+    error: userError,
+  } = await supabase.auth.getUser();
+
+  if (userError) throw new Error('No se pudo validar la sesión.');
+  if (!user) redirect('/auth/login');
+
+  // Traigo la tx base para saber cómo agrupar "similares"
+  const { data: base, error: baseErr } = await supabase
+    .from('transactions')
+    .select('id,user_id,account_id,merchant_name,description_raw')
+    .eq('id', input.txId)
+    .single();
+
+  if (baseErr || !base) throw new Error('No se encontró la transacción.');
+  if (base.user_id !== user.id) throw new Error('No autorizado.');
+
+  const merchantName = cleanTextOrNull(input.merchantName);
+  const categoryId = cleanTextOrNull(input.categoryId);
+
+  const patch: Record<string, any> = {
+    merchant_name: merchantName,
+    category_id: categoryId,
+  };
+
+  if (input.applyToSimilar) {
+    // "similares" = mismo account + mismo merchant_name (si existe),
+    // si merchant_name es null, entonces merchant_name NULL + mismo description_raw.
+    let q = supabase
+      .from('transactions')
+      .update(patch)
+      .eq('user_id', user.id)
+      .eq('account_id', base.account_id);
+
+    if (base.merchant_name) {
+      q = q.eq('merchant_name', base.merchant_name);
+    } else {
+      q = q.is('merchant_name', null).eq('description_raw', base.description_raw);
+    }
+
+    const { error: updErr } = await q;
+    if (updErr) {
+      console.error('updateTransactionInline (similar) error:', updErr);
+      throw new Error('Error actualizando transacciones similares.');
+    }
+  } else {
+    const { error: updErr } = await supabase
+      .from('transactions')
+      .update(patch)
+      .eq('user_id', user.id)
+      .eq('id', input.txId);
+
+    if (updErr) {
+      console.error('updateTransactionInline (single) error:', updErr);
+      throw new Error('Error actualizando la transacción.');
+    }
+  }
+
+  // LINK GLOBAL: Merchant → Categoría en merchant_rules (para futuros imports/autocategorización)
+  // Se crea/actualiza una regla exacta (case-insensitive por normalizeText del matcher).
+  if (merchantName && categoryId) {
+    const { error: ruleErr } = await supabase
+      .from('merchant_rules')
+      .upsert(
+        {
+          user_id: user.id,
+          pattern: merchantName,
+          match_type: 'equals',
+          merchant_name: merchantName,
+          category_id: categoryId,
+          priority: 1000,
+        },
+        { onConflict: 'user_id,match_type,pattern' }
+      );
+
+    if (ruleErr) {
+      console.error('merchant_rules upsert error:', ruleErr);
+      throw new Error('Se guardó la transacción, pero falló el link Merchant→Categoría (merchant_rules).');
+    }
+  }
+
+  revalidatePath('/protected/transactions');
+  revalidatePath('/protected/transactions/import-pdf');
 }

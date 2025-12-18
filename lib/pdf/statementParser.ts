@@ -39,6 +39,19 @@ function normalizeDescription(raw: string): string {
     .trim();
 }
 
+/**
+ * Normaliza para comparar "etiquetas" (case-insensitive, sin tildes, espacios colapsados).
+ * Útil para filtrar descripciones especiales como "SU PAGO EN PESOS".
+ */
+function normalizeForCompare(s: string): string {
+  return s
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+}
+
 function groupByLine(items: Item[], yTol = 2): Item[][] {
   const bins = new Map<number, Item[]>();
   for (const it of items) {
@@ -172,9 +185,15 @@ export async function parseVisaPdf(buffer: Buffer): Promise<Tx[]> {
         installmentsTotal = Number(m[2]);
       }
 
+      const description = normalizeDescription(descRaw);
+      if (!description) continue;
+
+      // EXCLUSIÓN: "SU PAGO EN PESOS" no se considera consumo/gasto -> no se parsea
+      if (normalizeForCompare(description) === "SU PAGO EN PESOS") continue;
+
       out.push({
         date: parseDateDDMMYY(dateTok),
-        description: normalizeDescription(descRaw),
+        description,
         receipt: compRaw ? compRaw.replace(/\D/g, "") : null,
         installmentNumber,
         installmentsTotal,
