@@ -1,296 +1,643 @@
 // app/(protected)/transactions/page.tsx
+import { redirect } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
+import type { Account, Category, TransactionType } from "@/types/db";
+import TransactionsTableClient from "./TransactionsTableClient";
 
-type SearchParams = Record<string, string | string[] | undefined>;
+type TxRow = {
+  id: string;
+  user_id: string;
+  account_id: string;
+  date: string; // YYYY-MM-DD
+  description_raw: string;
+  merchant_name: string | null;
+  category_id: string | null;
+  amount: number;
+  type: TransactionType;
+  import_batch_id: string | null;
+  created_at: string;
 
-type TxType = "expense" | "income" | "transfer" | "payment" | "fee";
+  receipt?: string | null;
+  installment_number?: number | null;
+  installments_total?: number | null;
+};
 
-function fmtArs(n: number) {
-  return new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS" }).format(n);
+type ImportBatchRow = {
+  id: string;
+  user_id: string;
+  account_id: string;
+  created_at: string; // timestamptz
+  provider: string | null;
+  institution: string | null;
+  file_name: string | null;
+  due_date: string | null; // date
+  cut_off_date: string | null; // date
+  statement_period_start: string | null; // date
+  statement_period_end: string | null; // date
+  note: string | null;
+};
+
+function firstDayOfMonthISO(d = new Date()) {
+  const x = new Date(d.getFullYear(), d.getMonth(), 1);
+  return x.toISOString().slice(0, 10);
 }
 
-function asString(v: string | string[] | undefined) {
-  return typeof v === "string" ? v : undefined;
+function lastDayOfMonthISO(d = new Date()) {
+  const x = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+  return x.toISOString().slice(0, 10);
 }
 
-function parseTypes(sp: SearchParams): TxType[] | null {
-  const t = asString(sp.type);
-  const types = asString(sp.types);
-
-  const raw = (t ?? types)?.trim();
-  if (!raw) return null;
-
-  const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  const allowed: TxType[] = ["expense", "income", "transfer", "payment", "fee"];
-  const out = parts.filter((p) => allowed.includes(p as TxType)) as TxType[];
-  return out.length ? out : null;
+function getParam(sp: Record<string, string | string[] | undefined>, key: string): string | undefined {
+  const v = sp[key];
+  return Array.isArray(v) ? v[0] : v;
 }
 
-function buildSelfHref(filters: Record<string, string | undefined>) {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(filters)) {
-    if (v !== undefined && v !== "") qs.set(k, v);
+function buildQueryString(
+  sp: Record<string, string | string[] | undefined>,
+  patch: Record<string, string | undefined>
+) {
+  const params = new URLSearchParams();
+
+  for (const [k, v] of Object.entries(sp)) {
+    const val = Array.isArray(v) ? v[0] : v;
+    if (val != null && val !== "") params.set(k, val);
   }
-  return `/protected/transactions?${qs.toString()}`;
+
+  for (const [k, v] of Object.entries(patch)) {
+    if (v == null || v === "") params.delete(k);
+    else params.set(k, v);
+  }
+
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
 }
 
-export default async function TransactionsPage({ searchParams }: { searchParams: SearchParams }) {
+function formatMoneyARS(n: number, currency = "ARS") {
+  try {
+    return new Intl.NumberFormat("es-AR", {
+      style: "currency",
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(Number(n));
+  } catch {
+    return Number(n).toFixed(2);
+  }
+}
+
+function batchLabel(b: ImportBatchRow) {
+  const ref = b.due_date ?? (b.created_at ? b.created_at.slice(0, 10) : "");
+  const provider = b.provider ? b.provider.toUpperCase() : "PDF";
+  const note = b.note ? ` · ${b.note}` : "";
+  const file = b.file_name ? ` · ${b.file_name}` : "";
+  return `${provider} · ${ref}${note}${file}`;
+}
+
+export default async function TransactionsPage(props: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
   const supabase = await createClient();
 
-  const from = asString(searchParams.from);
-  const to = asString(searchParams.to);
-  const accountId = asString(searchParams.accountId);
-  const categoryId = asString(searchParams.categoryId);
-  const merchant = asString(searchParams.merchant);
-  const q = asString(searchParams.q);
+  // claims + user (tu flujo actual)
+  const { data, error } = await supabase.auth.getClaims();
+  if (error || !data?.claims) redirect("/auth/login");
 
-  const uncategorized =
-    asString(searchParams.uncategorized) === "1" ||
-    asString(searchParams.uncategorized)?.toLowerCase() === "true";
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) redirect("/auth/login");
 
-  const types = parseTypes(searchParams);
+  const sp = await props.searchParams;
 
-  // Paginación simple
-  const page = Math.max(1, Number(asString(searchParams.page) ?? "1"));
-  const pageSize = Math.min(200, Math.max(10, Number(asString(searchParams.pageSize) ?? "50")));
-  const fromRow = (page - 1) * pageSize;
-  const toRow = fromRow + pageSize - 1;
+  const accountId = getParam(sp, "account") ?? "";
+  const type = (getParam(sp, "type") ?? "") as TransactionType | "";
+  const categoryId = getParam(sp, "category") ?? "";
+  const q = (getParam(sp, "q") ?? "").trim();
+  const uncategorized = getParam(sp, "uncategorized") === "1";
 
-  // Listas para filtros (asumiendo RLS por user_id)
-  const [{ data: accounts }, { data: categories }] = await Promise.all([
-    supabase.from("accounts").select("id, name").order("name"),
-    supabase.from("categories").select("id, name").order("name"),
+  // NUEVO: batch y control de fecha secundaria
+  const batchId = getParam(sp, "batch") ?? "";
+  const hasBatch = !!batchId;
+
+  // Si hay batch: por defecto NO filtrar por fecha (a menos que useDate=1)
+  const useDateParam = getParam(sp, "useDate") === "1";
+  const useDate = hasBatch ? useDateParam : true;
+
+  // Valores crudos desde URL (sirven para UI y, si useDate, para filtrar)
+  const fromParam = getParam(sp, "from") ?? "";
+  const toParam = getParam(sp, "to") ?? "";
+
+  const per = Math.min(Math.max(Number(getParam(sp, "per") ?? "50") || 50, 10), 200);
+  const page = Math.max(Number(getParam(sp, "page") ?? "1") || 1, 1);
+
+  const fromIdx = (page - 1) * per;
+  const toIdx = fromIdx + per - 1;
+
+  const [
+    { data: accountsData },
+    { data: categoriesData },
+    { data: batchesData, error: batchesErr },
+  ] = await Promise.all([
+    supabase
+      .from("accounts")
+      .select(
+        "id, user_id, name, type, institution, currency, credit_limit, cut_off_day, due_day, interest_rate, created_at"
+      )
+      .eq("user_id", user.id)
+      .order("name", { ascending: true }),
+    supabase
+      .from("categories")
+      .select("id, user_id, name, subcategory, is_essential, color, created_at")
+      .eq("user_id", user.id)
+      .order("name", { ascending: true }),
+    supabase
+      .from("import_batches")
+      .select(
+        "id,user_id,account_id,created_at,provider,institution,file_name,due_date,cut_off_date,statement_period_start,statement_period_end,note"
+      )
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(50),
   ]);
 
-  // Query base
-  let query = supabase
-    .from("transactions")
-    .select(
-      "id, date, description_raw, merchant_name, category_id, account_id, amount, type, receipt, installment_number, installments_total, created_at",
-      { count: "exact" }
-    );
+  const accounts = (accountsData ?? []) as Account[];
+  const categories = (categoriesData ?? []) as Category[];
 
-  if (from) query = query.gte("date", from);
-  if (to) query = query.lte("date", to);
-  if (accountId) query = query.eq("account_id", accountId);
-  if (categoryId) query = query.eq("category_id", categoryId);
+  const allBatches = (batchesData ?? []) as ImportBatchRow[];
+  const selectedBatch = batchId ? allBatches.find((b) => b.id === batchId) ?? null : null;
 
-  // Filtro "Sin categoría" (diseñado para gastos)
-  if (uncategorized) {
-    query = query.is("category_id", null).in("type", ["expense", "fee"]);
-  } else if (types?.length) {
-    query = query.in("type", types);
+  // Si filtrás por cuenta, aplicalo al dropdown, pero asegurá que el batch seleccionado siga apareciendo
+  let batches = accountId ? allBatches.filter((b) => b.account_id === accountId) : allBatches;
+  if (selectedBatch && !batches.some((b) => b.id === selectedBatch.id)) {
+    batches = [selectedBatch, ...batches];
   }
 
-  if (merchant) query = query.ilike("merchant_name", `%${merchant}%`);
-  if (q) query = query.ilike("description_raw", `%${q}%`);
+  if (batchesErr) {
+    console.error("Error cargando import_batches:", batchesErr);
+  }
 
-  // Orden + paginado
-  const { data: rows, count, error } = await query
+  // Sugerencias de período basadas en el batch (para UI)
+  const suggestedFrom =
+    selectedBatch?.statement_period_start ??
+    selectedBatch?.cut_off_date ??
+    "";
+  const suggestedTo =
+    selectedBatch?.statement_period_end ??
+    selectedBatch?.due_date ??
+    "";
+
+  // Valores por defecto para inputs (UI)
+  const fromUi = hasBatch ? (fromParam || suggestedFrom || "") : (fromParam || firstDayOfMonthISO());
+  const toUi = hasBatch ? (toParam || suggestedTo || "") : (toParam || lastDayOfMonthISO());
+
+  // Valores efectivos para filtrar por fecha (solo si corresponde)
+  const fromEff =
+    (!hasBatch || useDate)
+      ? (hasBatch ? (fromParam || suggestedFrom || "") : (fromParam || firstDayOfMonthISO()))
+      : undefined;
+
+  const toEff =
+    (!hasBatch || useDate)
+      ? (hasBatch ? (toParam || suggestedTo || "") : (toParam || lastDayOfMonthISO()))
+      : undefined;
+
+  // Query transacciones paginadas
+  let txQ = supabase
+    .from("transactions")
+    .select(
+      "id,user_id,account_id,date,description_raw,merchant_name,category_id,amount,type,import_batch_id,created_at,receipt,installment_number,installments_total",
+      { count: "exact" }
+    )
+    .eq("user_id", user.id);
+
+  // 1) Batch primero
+  if (batchId) txQ = txQ.eq("import_batch_id", batchId);
+
+  // 2) Fecha secundaria (solo si no hay batch o si useDate=1)
+  if (!hasBatch || useDate) {
+    if (fromEff) txQ = txQ.gte("date", fromEff);
+    if (toEff) txQ = txQ.lte("date", toEff);
+  }
+
+  if (accountId) txQ = txQ.eq("account_id", accountId);
+  if (type) txQ = txQ.eq("type", type);
+
+  if (uncategorized) txQ = txQ.is("category_id", null);
+  else if (categoryId) txQ = txQ.eq("category_id", categoryId);
+
+  if (q) {
+    const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+    txQ = txQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
+  }
+
+  const { data: txData, error: txErr, count } = await txQ
     .order("date", { ascending: false })
     .order("created_at", { ascending: false })
-    .range(fromRow, toRow);
+    .range(fromIdx, toIdx);
 
-  // Lookups (evita join complejo; estable)
-  const catMap = new Map((categories ?? []).map((c: any) => [c.id, c.name]));
-  const accMap = new Map((accounts ?? []).map((a: any) => [a.id, a.name]));
+  if (txErr) console.error("Error cargando transactions:", txErr);
 
-  // Totales (del período/selección principal). Nota: tx_totals no contempla category/merchant/q;
-  // pero sirve como KPI de contexto. Si querés "totales exactos del filtro", lo resolvemos con otro RPC.
-  const { data: totals } = await supabase.rpc("tx_totals", {
-    p_from: from ?? "1900-01-01",
-    p_to: to ?? "2999-12-31",
-    p_account_id: accountId ?? null,
-    p_types: uncategorized ? ["expense", "fee"] : types ?? null,
-  });
-  const t0: any = totals?.[0];
-  const totalAmount = Number(t0?.total_amount ?? 0);
-  const txCount = Number(t0?.tx_count ?? 0);
+  const rows = (txData ?? []) as TxRow[];
+  const totalCount = count ?? 0;
+  const totalPages = Math.max(Math.ceil(totalCount / per), 1);
 
-  const totalPages = Math.max(1, Math.ceil(Number(count ?? 0) / pageSize));
+  /**
+   * TOTALES
+   * - Si hay batch: calculo totales por query directa (refleja el batch y respeta filtros).
+   * - Si NO hay batch: uso tu RPC existente.
+   */
+  let totals:
+    | null
+    | {
+        total: number;
+        expense: number;
+        income: number;
+        payment: number;
+        transfer: number;
+        fee: number;
+        other: number;
+        count: number;
+      } = null;
 
-  const currentFilters = {
-    from,
-    to,
-    accountId: accountId ?? undefined,
-    categoryId: categoryId ?? undefined,
-    merchant: merchant ?? undefined,
-    q: q ?? undefined,
-    type: (types?.length ? types.join(",") : undefined),
-    uncategorized: uncategorized ? "1" : undefined,
-    pageSize: String(pageSize),
-  };
+  if (batchId) {
+    let totalsQ = supabase
+      .from("transactions")
+      .select("amount,type,category_id,merchant_name,description_raw", { count: "exact" })
+      .eq("user_id", user.id)
+      .eq("import_batch_id", batchId)
+      .range(0, 4999);
+
+    // Fecha secundaria
+    if (useDate) {
+      if (fromEff) totalsQ = totalsQ.gte("date", fromEff);
+      if (toEff) totalsQ = totalsQ.lte("date", toEff);
+    }
+
+    if (accountId) totalsQ = totalsQ.eq("account_id", accountId);
+    if (type) totalsQ = totalsQ.eq("type", type);
+
+    if (uncategorized) totalsQ = totalsQ.is("category_id", null);
+    else if (categoryId) totalsQ = totalsQ.eq("category_id", categoryId);
+
+    if (q) {
+      const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+      totalsQ = totalsQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
+    }
+
+    const { data: allRows, error: allErr, count: allCount } = await totalsQ;
+
+    if (allErr) {
+      console.error("Totales por batch (query directa) error:", allErr);
+      totals = null;
+    } else {
+      const acc = {
+        total: 0,
+        expense: 0,
+        income: 0,
+        payment: 0,
+        transfer: 0,
+        fee: 0,
+        other: 0,
+        count: Number(allCount ?? 0),
+      };
+
+      for (const r of allRows ?? []) {
+        const amount = Number((r as any).amount ?? 0);
+        const t = String((r as any).type ?? "other") as TransactionType | "other";
+
+        acc.total += amount;
+        if (t === "expense") acc.expense += amount;
+        else if (t === "income") acc.income += amount;
+        else if (t === "payment") acc.payment += amount;
+        else if (t === "transfer") acc.transfer += amount;
+        else if (t === "fee") acc.fee += amount;
+        else acc.other += amount;
+      }
+
+      totals = acc;
+    }
+  } else {
+    const { data: totalsData, error: totalsErr } = await supabase.rpc("tx_totals", {
+      p_user_id: user.id,
+      p_from: fromEff ?? firstDayOfMonthISO(),
+      p_to: toEff ?? lastDayOfMonthISO(),
+      p_account_id: accountId || null,
+      p_type: type || null,
+      p_category_id: uncategorized ? null : categoryId || null,
+      p_uncategorized: uncategorized,
+      p_q: q || null,
+    });
+
+    if (totalsErr) console.error("tx_totals RPC error:", totalsErr);
+    totals = (Array.isArray(totalsData) ? totalsData[0] : null) as any;
+  }
+
+  // Conteo “sin categoría” (misma base + batch + fecha secundaria)
+  let uncQ = supabase
+    .from("transactions")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", user.id);
+
+  if (batchId) uncQ = uncQ.eq("import_batch_id", batchId);
+
+  if (!hasBatch || useDate) {
+    if (fromEff) uncQ = uncQ.gte("date", fromEff);
+    if (toEff) uncQ = uncQ.lte("date", toEff);
+  }
+
+  if (accountId) uncQ = uncQ.eq("account_id", accountId);
+  if (type) uncQ = uncQ.eq("type", type);
+
+  if (q) {
+    const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+    uncQ = uncQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
+  }
+
+  uncQ = uncQ.is("category_id", null);
+
+  const { count: uncategorizedCount, error: uncErr } = await uncQ;
+  if (uncErr) console.error("uncategorized count error:", uncErr);
+
+  const basePath = "/protected/transactions";
 
   return (
-    <div className="mx-auto w-full max-w-6xl p-4 space-y-4">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <h1 className="text-2xl font-semibold">Transacciones</h1>
-          <div className="text-sm text-muted-foreground">
-            Resultado: <span className="font-medium">{count ?? 0}</span> | Contexto período/tipo:{" "}
-            <span className="font-medium">{txCount}</span> | Total: <span className="font-medium">{fmtArs(totalAmount)}</span>
+    <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 space-y-4">
+      {/* Header */}
+      <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-xl font-semibold text-slate-100">Transacciones</h1>
+          <div className="text-sm text-slate-300">
+            Mostrando {rows.length} de {totalCount} (página {page} de {totalPages})
           </div>
+
+          {selectedBatch ? (
+            <div className="mt-2 text-xs text-slate-300">
+              <span className="rounded-md border border-slate-700 bg-slate-950/40 px-2 py-1 inline-flex items-center">
+                Resumen seleccionado:{" "}
+                <span className="ml-2 text-slate-100 font-medium">
+                  {batchLabel(selectedBatch)}
+                </span>
+              </span>
+              {!useDate ? (
+                <div className="mt-1 text-[11px] text-slate-400">
+                  El rango de fechas no filtra mientras haya un Resumen seleccionado (activá “Filtrar por fecha” si lo necesitás).
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
 
-        <div className="flex gap-2">
-          <Link className="h-9 px-3 rounded-md border inline-flex items-center" href="/protected/reports">
-            Ir a Reportes
+        <div className="flex flex-wrap gap-2 md:justify-end">
+          <Link
+            href="/protected/reports"
+            className="inline-flex items-center justify-center rounded-md border border-slate-700 px-4 py-1.5 text-sm text-slate-200 hover:bg-slate-800"
+          >
+            Ir a Visualizaciones
           </Link>
-          <Link className="h-9 px-3 rounded-md bg-primary text-primary-foreground inline-flex items-center" href="/protected/transactions/import-pdf">
+          <Link
+            href="/protected/transactions/import-pdf"
+            className="inline-flex items-center justify-center rounded-md bg-emerald-500 px-4 py-1.5 text-sm font-medium text-slate-950 hover:bg-emerald-400"
+          >
             Importar PDF
           </Link>
         </div>
       </div>
 
-      {error ? (
-        <div className="rounded-md border p-3 text-sm">
-          Error al cargar transacciones: <span className="text-muted-foreground">{error.message}</span>
+      {/* Totales */}
+      <div className="text-right text-sm text-slate-300">
+        <div>
+          Total filtro:{" "}
+          <span className="text-slate-100 font-medium">
+            {formatMoneyARS(Number(totals?.total ?? 0))}
+          </span>
         </div>
-      ) : null}
+        <div className="text-xs text-slate-400">
+          Gastos: {formatMoneyARS(Number(totals?.expense ?? 0))} · Ingresos:{" "}
+          {formatMoneyARS(Number(totals?.income ?? 0))} · Pagos:{" "}
+          {formatMoneyARS(Number(totals?.payment ?? 0))}
+        </div>
+      </div>
 
-      {/* Barra de filtros (GET) */}
-      <form method="get" className="rounded-lg border p-4 grid grid-cols-1 md:grid-cols-6 gap-3">
-        <div className="grid gap-1">
-          <label className="text-xs text-muted-foreground">Desde</label>
-          <input name="from" defaultValue={from ?? ""} type="date" className="h-9 rounded-md border px-2 bg-background" />
+      {/* Atajo “Sin categoría” */}
+      <div className="flex items-center gap-2">
+        <Link
+          href={
+            basePath +
+            buildQueryString(sp, {
+              uncategorized: "1",
+              category: "",
+              page: "1",
+            })
+          }
+          className="inline-flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-sm text-amber-200 hover:bg-amber-500/15"
+        >
+          Sin categoría
+          <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-100 border border-amber-500/30">
+            {uncategorizedCount ?? 0}
+          </span>
+        </Link>
+
+        {uncategorized && (
+          <Link
+            href={basePath + buildQueryString(sp, { uncategorized: "", page: "1" })}
+            className="text-sm text-slate-300 hover:text-slate-100"
+          >
+            Quitar filtro
+          </Link>
+        )}
+      </div>
+
+      {/* Filtros */}
+      <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+        <div className="md:col-span-2">
+          <label className="text-xs text-slate-300">Desde</label>
+          <input
+            type="date"
+            name="from"
+            defaultValue={fromUi}
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+          />
         </div>
 
-        <div className="grid gap-1">
-          <label className="text-xs text-muted-foreground">Hasta</label>
-          <input name="to" defaultValue={to ?? ""} type="date" className="h-9 rounded-md border px-2 bg-background" />
+        <div className="md:col-span-2">
+          <label className="text-xs text-slate-300">Hasta</label>
+          <input
+            type="date"
+            name="to"
+            defaultValue={toUi}
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+          />
         </div>
 
-        <div className="grid gap-1">
-          <label className="text-xs text-muted-foreground">Cuenta</label>
-          <select name="accountId" defaultValue={accountId ?? ""} className="h-9 rounded-md border px-2 bg-background">
+        <div className="md:col-span-3">
+          <label className="text-xs text-slate-300">Cuenta</label>
+          <select
+            name="account"
+            defaultValue={accountId}
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+          >
             <option value="">Todas</option>
-            {(accounts ?? []).map((a: any) => (
+            {accounts.map((a) => (
               <option key={a.id} value={a.id}>
-                {a.name}
+                {a.name} ({a.currency})
               </option>
             ))}
           </select>
         </div>
 
-        <div className="grid gap-1">
-          <label className="text-xs text-muted-foreground">Tipo</label>
-          <select name="type" defaultValue={(types?.[0] ?? "") as any} className="h-9 rounded-md border px-2 bg-background">
+        {/* Selector de resumen PDF */}
+        <div className="md:col-span-5">
+          <label className="text-xs text-slate-300">Resumen (PDF importado)</label>
+          <select
+            name="batch"
+            defaultValue={batchId}
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+          >
             <option value="">Todos</option>
-            <option value="expense">expense</option>
-            <option value="income">income</option>
-            <option value="payment">payment</option>
-            <option value="fee">fee</option>
-            <option value="transfer">transfer</option>
+            {batches.map((b) => (
+              <option key={b.id} value={b.id}>
+                {batchLabel(b)}
+              </option>
+            ))}
           </select>
-          {/* Nota: si querés multi-tipo, podés reemplazar esto por un input types="expense,fee" */}
+          <div className="mt-1 text-[11px] text-slate-400">
+            Consejo: cargá <span className="text-slate-200">Vencimiento</span> y{" "}
+            <span className="text-slate-200">Nota</span> al importar para poder encontrarlo luego.
+          </div>
         </div>
 
-        <div className="grid gap-1">
-          <label className="text-xs text-muted-foreground">Categoría</label>
-          <select name="categoryId" defaultValue={categoryId ?? ""} className="h-9 rounded-md border px-2 bg-background">
+        {/* Fecha secundaria: sólo tiene efecto si hay batch y se activa */}
+        <div className="md:col-span-2 flex items-center gap-2">
+          <input
+            id="useDate"
+            type="checkbox"
+            name="useDate"
+            value="1"
+            defaultChecked={useDate}
+            className="h-4 w-4 accent-emerald-500"
+          />
+          <label htmlFor="useDate" className="text-sm text-slate-200">
+            Filtrar por fecha
+          </label>
+        </div>
+
+        <div className="md:col-span-2">
+          <label className="text-xs text-slate-300">Tipo</label>
+          <select
+            name="type"
+            defaultValue={type}
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+          >
+            <option value="">Todos</option>
+            <option value="expense">Gasto</option>
+            <option value="income">Ingreso</option>
+            <option value="payment">Pago</option>
+            <option value="transfer">Transferencia</option>
+            <option value="fee">Comisión</option>
+            <option value="other">Otro</option>
+          </select>
+        </div>
+
+        <div className="md:col-span-3">
+          <label className="text-xs text-slate-300">Categoría</label>
+          <select
+            name="category"
+            defaultValue={categoryId}
+            disabled={uncategorized}
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-60"
+          >
             <option value="">Todas</option>
-            {(categories ?? []).map((c: any) => (
+            {categories.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
+                {c.subcategory ? ` / ${c.subcategory}` : ""}
               </option>
             ))}
           </select>
         </div>
 
-        <div className="grid gap-1">
-          <label className="text-xs text-muted-foreground">Merchant (contiene)</label>
-          <input name="merchant" defaultValue={merchant ?? ""} className="h-9 rounded-md border px-2 bg-background" placeholder="Ej: MERPAGO" />
+        <div className="md:col-span-3">
+          <label className="text-xs text-slate-300">Buscar</label>
+          <input
+            type="text"
+            name="q"
+            defaultValue={q}
+            placeholder="Ej: mercadopago, shell..."
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+          />
         </div>
 
-        <div className="md:col-span-4 grid gap-1">
-          <label className="text-xs text-muted-foreground">Buscar en descripción</label>
-          <input name="q" defaultValue={q ?? ""} className="h-9 rounded-md border px-2 bg-background" placeholder="Texto libre (ilike)" />
-        </div>
-
-        <div className="md:col-span-1 flex items-end gap-2">
-          <label className="text-sm inline-flex items-center gap-2 select-none">
-            <input name="uncategorized" type="checkbox" value="1" defaultChecked={uncategorized} />
+        <div className="md:col-span-2 flex items-center gap-2">
+          <input
+            id="uncategorized"
+            type="checkbox"
+            name="uncategorized"
+            value="1"
+            defaultChecked={uncategorized}
+            className="h-4 w-4 accent-emerald-500"
+          />
+          <label htmlFor="uncategorized" className="text-sm text-slate-200">
             Sin categoría
           </label>
         </div>
 
-        <div className="md:col-span-1 flex items-end gap-2">
-          <input type="hidden" name="pageSize" value={String(pageSize)} />
-          <button className="h-9 rounded-md bg-primary text-primary-foreground px-3 text-sm">Aplicar</button>
-          <Link className="h-9 rounded-md border px-3 text-sm inline-flex items-center" href="/protected/transactions">
+        <div className="md:col-span-2">
+          <label className="text-xs text-slate-300">Por página</label>
+          <select
+            name="per"
+            defaultValue={String(per)}
+            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+          >
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+        </div>
+
+        <input type="hidden" name="page" value="1" />
+
+        <div className="md:col-span-2 flex gap-2 justify-end">
+          <button
+            type="submit"
+            className="inline-flex items-center justify-center rounded-md bg-emerald-500 px-4 py-1.5 text-sm font-medium text-slate-950 hover:bg-emerald-400"
+          >
+            Aplicar
+          </button>
+          <Link
+            href={basePath}
+            className="inline-flex items-center justify-center rounded-md border border-slate-700 px-4 py-1.5 text-sm text-slate-200 hover:bg-slate-800"
+          >
             Limpiar
           </Link>
         </div>
       </form>
 
-      {/* Lista */}
-      <div className="rounded-lg border overflow-hidden">
-        <div className="grid grid-cols-12 gap-2 px-3 py-2 text-xs text-muted-foreground border-b">
-          <div className="col-span-2">Fecha</div>
-          <div className="col-span-4">Descripción</div>
-          <div className="col-span-2">Merchant</div>
-          <div className="col-span-2">Categoría</div>
-          <div className="col-span-1">Tipo</div>
-          <div className="col-span-1 text-right">Monto</div>
-        </div>
-
-        {(rows ?? []).map((r: any) => {
-          const catName = r.category_id ? catMap.get(r.category_id) : "Sin categoría";
-          const accName = r.account_id ? accMap.get(r.account_id) : "";
-          return (
-            <div key={r.id} className="grid grid-cols-12 gap-2 px-3 py-2 text-sm border-b last:border-b-0">
-              <div className="col-span-2">
-                <div className="font-medium">{r.date}</div>
-                <div className="text-xs text-muted-foreground truncate">{accName}</div>
-              </div>
-
-              <div className="col-span-4 min-w-0">
-                <div className="truncate">{r.description_raw}</div>
-                <div className="text-xs text-muted-foreground">
-                  {r.receipt ? `Comp: ${r.receipt}` : ""}
-                  {r.installment_number ? ` · Cuota: ${r.installment_number}/${r.installments_total ?? "?"}` : ""}
-                </div>
-              </div>
-
-              <div className="col-span-2 min-w-0">
-                <div className="truncate">{r.merchant_name ?? "—"}</div>
-              </div>
-
-              <div className="col-span-2 min-w-0">
-                <div className="truncate">{catName}</div>
-              </div>
-
-              <div className="col-span-1">
-                <div className="text-xs rounded-md border px-2 py-1 inline-block">{r.type}</div>
-              </div>
-
-              <div className="col-span-1 text-right font-semibold">{fmtArs(Number(r.amount ?? 0))}</div>
-            </div>
-          );
-        })}
-
-        {(rows ?? []).length === 0 ? (
-          <div className="p-4 text-sm text-muted-foreground">Sin transacciones para el filtro actual.</div>
-        ) : null}
-      </div>
+      {/* Tabla con quick edits */}
+      <TransactionsTableClient rows={rows} accounts={accounts} categories={categories} />
 
       {/* Paginación */}
       <div className="flex items-center justify-between">
-        <div className="text-sm text-muted-foreground">
-          Página {page} de {totalPages}
-        </div>
+        <div className="text-xs text-slate-400">Página {page} de {totalPages}</div>
 
         <div className="flex gap-2">
           <Link
-            className={`h-9 px-3 rounded-md border inline-flex items-center ${page <= 1 ? "pointer-events-none opacity-50" : ""}`}
-            href={buildSelfHref({ ...currentFilters, page: String(page - 1) })}
+            aria-disabled={page <= 1}
+            className={`rounded-md border border-slate-700 px-3 py-1 text-sm ${
+              page <= 1 ? "opacity-50 pointer-events-none" : "hover:bg-slate-800"
+            }`}
+            href={basePath + buildQueryString(sp, { page: String(page - 1) })}
           >
             Anterior
           </Link>
+
           <Link
-            className={`h-9 px-3 rounded-md border inline-flex items-center ${page >= totalPages ? "pointer-events-none opacity-50" : ""}`}
-            href={buildSelfHref({ ...currentFilters, page: String(page + 1) })}
+            aria-disabled={page >= totalPages}
+            className={`rounded-md border border-slate-700 px-3 py-1 text-sm ${
+              page >= totalPages ? "opacity-50 pointer-events-none" : "hover:bg-slate-800"
+            }`}
+            href={basePath + buildQueryString(sp, { page: String(page + 1) })}
           >
             Siguiente
           </Link>

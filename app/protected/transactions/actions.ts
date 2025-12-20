@@ -1,4 +1,4 @@
-// app/protected/transactions/actions.ts
+// app/(protected)/transactions/actions.ts
 'use server';
 
 import { createClient } from '@/lib/supabase/server';
@@ -82,6 +82,20 @@ function cleanTextOrNull(v: unknown): string | null {
   return s ? s : null;
 }
 
+function isoDateOrNull(v: unknown, fieldName: string): string | null {
+  const s = String(v ?? '').trim();
+  if (!s) return null;
+  // input type="date" -> YYYY-MM-DD
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    throw new Error(`Fecha inválida en ${fieldName}. Debe ser YYYY-MM-DD.`);
+  }
+  return s;
+}
+
+function sha256Hex(buf: Buffer): string {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
 /**
  * IMPORT PDF
  */
@@ -107,8 +121,20 @@ export async function importTransactionsFromPdf(formData: FormData) {
   if (!(file instanceof File)) throw new Error('Falta el archivo PDF.');
   if (file.type && file.type !== 'application/pdf') throw new Error('El archivo no es un PDF.');
 
+  // Metadata opcional del statement (para “Vencimiento Noviembre 2025”, etc.)
+  // Estos nombres de campos los podés agregar al <form> cuando quieras.
+  const provider = cleanTextOrNull(formData.get('provider')) ?? 'VISA';
+  const institution = cleanTextOrNull(formData.get('institution')) ?? null;
+  const note = cleanTextOrNull(formData.get('note')) ?? null;
+
+  const dueDate = isoDateOrNull(formData.get('due_date'), 'due_date');
+  const cutOffDate = isoDateOrNull(formData.get('cut_off_date'), 'cut_off_date');
+  const periodStart = isoDateOrNull(formData.get('statement_period_start'), 'statement_period_start');
+  const periodEnd = isoDateOrNull(formData.get('statement_period_end'), 'statement_period_end');
+
   const ab = await file.arrayBuffer();
   const buffer = Buffer.from(ab);
+  const fileHash = sha256Hex(buffer);
 
   const rows = await parseStatementPdf(buffer);
 
@@ -129,8 +155,42 @@ export async function importTransactionsFromPdf(formData: FormData) {
 
   const rules = (rulesData ?? []) as MerchantRule[];
 
-  const importBatchId = crypto.randomUUID();
+  // 1) Crear batch en DB (fuente de verdad para import_batch_id)
+  const { data: batch, error: batchErr } = await supabase
+    .from('import_batches')
+    .insert({
+      user_id: user.id,
+      account_id: accountId,
+      source: 'pdf',
+      provider,
+      institution,
+      file_name: file.name,
+      file_sha256: fileHash,
+      due_date: dueDate,
+      cut_off_date: cutOffDate,
+      statement_period_start: periodStart,
+      statement_period_end: periodEnd,
+      note,
+    })
+    .select('id')
+    .single();
 
+  if (batchErr) {
+    // Si usaste unique index por sha256, esta es la forma “limpia” de detectar duplicados
+    // (Postgres unique_violation = 23505)
+    const code = (batchErr as any)?.code;
+    if (code === '23505') {
+      console.warn('PDF duplicado detectado (sha256). Abortando import:', file.name);
+      redirect('/protected/transactions/import-pdf?imported=0&duplicate=1');
+    }
+
+    console.error('Error creando import_batch:', batchErr);
+    throw new Error('Error creando el batch de importación.');
+  }
+
+  const importBatchId = batch.id;
+
+  // 2) Armar inserts con import_batch_id real
   const inserts = rows.map((r) => {
     const type = normalizeType(r.description, fallbackType);
 
@@ -145,9 +205,9 @@ export async function importTransactionsFromPdf(formData: FormData) {
       user_id: user.id,
       account_id: accountId,
       date: r.date, // YYYY-MM-DD
-      description_raw: r.description, // solo alfabético
-      merchant_name: finalMerchantName,
-      category_id,
+      description_raw: r.description,
+      merchant_name: type === 'payment' ? null : finalMerchantName,
+      category_id: type === 'payment' ? null : category_id,
       amount: signedAmount(r.amount), // siempre positivo
       type,
       import_batch_id: importBatchId,
@@ -158,15 +218,28 @@ export async function importTransactionsFromPdf(formData: FormData) {
     };
   });
 
-  const { error: insErr, data: inserted } = await supabase.from('transactions').insert(inserts).select('id');
+  const { error: insErr, data: inserted } = await supabase
+    .from('transactions')
+    .insert(inserts)
+    .select('id');
 
   if (insErr) {
     console.error('Supabase insert error:', insErr);
+
+    // Cleanup best-effort: si falló insertar transactions, no dejamos batch “huérfano”
+    // (si ya insertaste algo parcial, esto no revierte; pero en tu caso inserts es una sola llamada).
+    try {
+      await supabase.from('import_batches').delete().eq('id', importBatchId).eq('user_id', user.id);
+    } catch (e) {
+      console.warn('No se pudo limpiar import_batches tras fallo de insert:', e);
+    }
+
     throw new Error('Error insertando transacciones en la base.');
   }
 
   revalidatePath('/protected/transactions');
   revalidatePath('/protected/transactions/import-pdf');
+  revalidatePath('/protected/reports');
 
   const importedCount = inserted?.length ?? inserts.length;
   redirect(`/protected/transactions/import-pdf?imported=${importedCount}`);
@@ -240,7 +313,6 @@ export async function updateTransactionInline(input: {
   }
 
   // LINK GLOBAL: Merchant → Categoría en merchant_rules (para futuros imports/autocategorización)
-  // Se crea/actualiza una regla exacta (case-insensitive por normalizeText del matcher).
   if (merchantName && categoryId) {
     const { error: ruleErr } = await supabase
       .from('merchant_rules')
@@ -258,10 +330,13 @@ export async function updateTransactionInline(input: {
 
     if (ruleErr) {
       console.error('merchant_rules upsert error:', ruleErr);
-      throw new Error('Se guardó la transacción, pero falló el link Merchant→Categoría (merchant_rules).');
+      throw new Error(
+        'Se guardó la transacción, pero falló el link Merchant→Categoría (merchant_rules).'
+      );
     }
   }
 
   revalidatePath('/protected/transactions');
   revalidatePath('/protected/transactions/import-pdf');
+  revalidatePath('/protected/reports');
 }
