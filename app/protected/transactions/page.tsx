@@ -9,7 +9,7 @@ type TxRow = {
   id: string;
   user_id: string;
   account_id: string;
-  date: string; // YYYY-MM-DD
+  date: string; // YYYY-MM-DD (fecha del movimiento)
   description_raw: string;
   merchant_name: string | null;
   category_id: string | null;
@@ -38,25 +38,40 @@ type ImportBatchRow = {
   note: string | null;
 };
 
-function firstDayOfMonthISO(d = new Date()) {
-  const x = new Date(d.getFullYear(), d.getMonth(), 1);
-  return x.toISOString().slice(0, 10);
-}
+type SearchParams = Record<string, string | string[] | undefined>;
 
-function lastDayOfMonthISO(d = new Date()) {
-  const x = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-  return x.toISOString().slice(0, 10);
-}
-
-function getParam(sp: Record<string, string | string[] | undefined>, key: string): string | undefined {
+function getParam(sp: SearchParams, key: string): string | undefined {
   const v = sp[key];
   return Array.isArray(v) ? v[0] : v;
 }
 
-function buildQueryString(
-  sp: Record<string, string | string[] | undefined>,
-  patch: Record<string, string | undefined>
-) {
+// Fecha local ISO (tz) sin librerías externas
+function getLocalISODate(tz = "America/Argentina/Cordoba", d = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const y = parts.find((p) => p.type === "year")?.value ?? "1970";
+  const m = parts.find((p) => p.type === "month")?.value ?? "01";
+  const day = parts.find((p) => p.type === "day")?.value ?? "01";
+  return `${y}-${m}-${day}`;
+}
+
+function startOfMonthISO(isoDate: string) {
+  return `${isoDate.slice(0, 7)}-01`;
+}
+
+// Fin de mes en TZ (evita off-by-one por UTC)
+function endOfMonthISO(isoDate: string, tz: string) {
+  const y = Number(isoDate.slice(0, 4));
+  const m0 = Number(isoDate.slice(5, 7)) - 1; // 0-11
+  const d = new Date(Date.UTC(y, m0 + 1, 0, 12, 0, 0)); // último día del mes (a mediodía UTC)
+  return getLocalISODate(tz, d);
+}
+
+function buildQueryString(sp: SearchParams, patch: Record<string, string | undefined>) {
   const params = new URLSearchParams();
 
   for (const [k, v] of Object.entries(sp)) {
@@ -95,7 +110,7 @@ function batchLabel(b: ImportBatchRow) {
 }
 
 export default async function TransactionsPage(props: {
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
+  searchParams: Promise<SearchParams>;
 }) {
   const supabase = await createClient();
 
@@ -110,29 +125,26 @@ export default async function TransactionsPage(props: {
 
   const sp = await props.searchParams;
 
-  const accountId = getParam(sp, "account") ?? "";
-  const type = (getParam(sp, "type") ?? "") as TransactionType | "";
-  const categoryId = getParam(sp, "category") ?? "";
+  const accountId = (getParam(sp, "account") ?? "").trim();
+  const type = ((getParam(sp, "type") ?? "").trim() as TransactionType | "") || "";
+  const categoryId = (getParam(sp, "category") ?? "").trim();
   const q = (getParam(sp, "q") ?? "").trim();
   const uncategorized = getParam(sp, "uncategorized") === "1";
 
-  // NUEVO: batch y control de fecha secundaria
-  const batchId = getParam(sp, "batch") ?? "";
-  const hasBatch = !!batchId;
+  // Batch (opcional)
+  const batchId = (getParam(sp, "batch") ?? "").trim();
 
-  // Si hay batch: por defecto NO filtrar por fecha (a menos que useDate=1)
-  const useDateParam = getParam(sp, "useDate") === "1";
-  const useDate = hasBatch ? useDateParam : true;
-
-  // Valores crudos desde URL (sirven para UI y, si useDate, para filtrar)
-  const fromParam = getParam(sp, "from") ?? "";
-  const toParam = getParam(sp, "to") ?? "";
-
+  // Paginación
   const per = Math.min(Math.max(Number(getParam(sp, "per") ?? "50") || 50, 10), 200);
   const page = Math.max(Number(getParam(sp, "page") ?? "1") || 1, 1);
 
   const fromIdx = (page - 1) * per;
   const toIdx = fromIdx + per - 1;
+
+  const tz = "America/Argentina/Cordoba";
+  const today = getLocalISODate(tz);
+  const defaultFrom = startOfMonthISO(today);
+  const defaultTo = endOfMonthISO(today, tz);
 
   const [
     { data: accountsData },
@@ -167,7 +179,7 @@ export default async function TransactionsPage(props: {
   const allBatches = (batchesData ?? []) as ImportBatchRow[];
   const selectedBatch = batchId ? allBatches.find((b) => b.id === batchId) ?? null : null;
 
-  // Si filtrás por cuenta, aplicalo al dropdown, pero asegurá que el batch seleccionado siga apareciendo
+  // Dropdown batches filtrado por cuenta, pero manteniendo el seleccionado visible
   let batches = accountId ? allBatches.filter((b) => b.account_id === accountId) : allBatches;
   if (selectedBatch && !batches.some((b) => b.id === selectedBatch.id)) {
     batches = [selectedBatch, ...batches];
@@ -177,59 +189,62 @@ export default async function TransactionsPage(props: {
     console.error("Error cargando import_batches:", batchesErr);
   }
 
-  // Sugerencias de período basadas en el batch (para UI)
-  const suggestedFrom =
-    selectedBatch?.statement_period_start ??
-    selectedBatch?.cut_off_date ??
-    "";
-  const suggestedTo =
-    selectedBatch?.statement_period_end ??
-    selectedBatch?.due_date ??
-    "";
+  /**
+   * FILTRO PRINCIPAL (NUEVO):
+   * Usamos budget_month (primer día de mes) para alinear:
+   * - Resúmenes TC: mes del due_date del batch
+   * - Transacciones manuales: mes de due_date si existe (o del date si no existe)
+   *
+   * UI sigue siendo “Desde / Hasta” con input date, pero el filtro se aplica por mes.
+   */
+  const fromParam = (getParam(sp, "from") ?? "").trim();
+  const toParam = (getParam(sp, "to") ?? "").trim();
 
-  // Valores por defecto para inputs (UI)
-  const fromUi = hasBatch ? (fromParam || suggestedFrom || "") : (fromParam || firstDayOfMonthISO());
-  const toUi = hasBatch ? (toParam || suggestedTo || "") : (toParam || lastDayOfMonthISO());
+  // Si hay batch y tiene due_date, sugerimos ese mes en la UI (sin forzar)
+  const batchDue = selectedBatch?.due_date ?? "";
+  const suggestedFromUi = batchDue ? startOfMonthISO(batchDue) : "";
+  const suggestedToUi = batchDue ? endOfMonthISO(batchDue, tz) : "";
 
-  // Valores efectivos para filtrar por fecha (solo si corresponde)
-  const fromEff =
-    (!hasBatch || useDate)
-      ? (hasBatch ? (fromParam || suggestedFrom || "") : (fromParam || firstDayOfMonthISO()))
-      : undefined;
+  const fromUi = fromParam || suggestedFromUi || defaultFrom;
+  const toUi = toParam || suggestedToUi || defaultTo;
 
-  const toEff =
-    (!hasBatch || useDate)
-      ? (hasBatch ? (toParam || suggestedTo || "") : (toParam || lastDayOfMonthISO()))
-      : undefined;
+  // Valores efectivos del filtro por mes (budget_month siempre es YYYY-MM-01)
+  const fromBudget = startOfMonthISO(fromUi);
+  const toBudget = startOfMonthISO(toUi);
 
-  // Query transacciones paginadas
+  // Helper: aplica filtros comunes a una query
+  const applyCommonFilters = (q0: any) => {
+    let qx = q0.eq("user_id", user.id);
+
+    // Filtro por mes imputado (budget_month)
+    qx = qx.gte("budget_month", fromBudget).lte("budget_month", toBudget);
+
+    // Batch (opcional)
+    if (batchId) qx = qx.eq("import_batch_id", batchId);
+
+    if (accountId) qx = qx.eq("account_id", accountId);
+    if (type) qx = qx.eq("type", type);
+
+    if (uncategorized) qx = qx.is("category_id", null);
+    else if (categoryId) qx = qx.eq("category_id", categoryId);
+
+    if (q) {
+      const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+      qx = qx.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
+    }
+
+    return qx;
+  };
+
+  // Query transacciones paginadas (listado)
   let txQ = supabase
     .from("transactions")
     .select(
       "id,user_id,account_id,date,description_raw,merchant_name,category_id,amount,type,import_batch_id,created_at,receipt,installment_number,installments_total",
       { count: "exact" }
-    )
-    .eq("user_id", user.id);
+    );
 
-  // 1) Batch primero
-  if (batchId) txQ = txQ.eq("import_batch_id", batchId);
-
-  // 2) Fecha secundaria (solo si no hay batch o si useDate=1)
-  if (!hasBatch || useDate) {
-    if (fromEff) txQ = txQ.gte("date", fromEff);
-    if (toEff) txQ = txQ.lte("date", toEff);
-  }
-
-  if (accountId) txQ = txQ.eq("account_id", accountId);
-  if (type) txQ = txQ.eq("type", type);
-
-  if (uncategorized) txQ = txQ.is("category_id", null);
-  else if (categoryId) txQ = txQ.eq("category_id", categoryId);
-
-  if (q) {
-    const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
-    txQ = txQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
-  }
+  txQ = applyCommonFilters(txQ);
 
   const { data: txData, error: txErr, count } = await txQ
     .order("date", { ascending: false })
@@ -243,118 +258,62 @@ export default async function TransactionsPage(props: {
   const totalPages = Math.max(Math.ceil(totalCount / per), 1);
 
   /**
-   * TOTALES
-   * - Si hay batch: calculo totales por query directa (refleja el batch y respeta filtros).
-   * - Si NO hay batch: uso tu RPC existente.
+   * TOTALES (alineados a budget_month)
+   * Para no depender de RPCs (que todavía filtran por `date`), calculamos en server-side
+   * paginando en chunks para que el total sea correcto.
    */
-  let totals:
-    | null
-    | {
-        total: number;
-        expense: number;
-        income: number;
-        payment: number;
-        transfer: number;
-        fee: number;
-        other: number;
-        count: number;
-      } = null;
+  const totalsAcc = {
+    total: 0,
+    expense: 0,
+    income: 0,
+    payment: 0,
+    transfer: 0,
+    fee: 0,
+    other: 0,
+    count: totalCount,
+  };
 
-  if (batchId) {
-    let totalsQ = supabase
-      .from("transactions")
-      .select("amount,type,category_id,merchant_name,description_raw", { count: "exact" })
-      .eq("user_id", user.id)
-      .eq("import_batch_id", batchId)
-      .range(0, 4999);
+  if (totalCount > 0) {
+    const CHUNK = 5000;
+    const pages = Math.ceil(totalCount / CHUNK);
 
-    // Fecha secundaria
-    if (useDate) {
-      if (fromEff) totalsQ = totalsQ.gte("date", fromEff);
-      if (toEff) totalsQ = totalsQ.lte("date", toEff);
-    }
+    for (let i = 0; i < pages; i++) {
+      const off = i * CHUNK;
+      const hi = off + CHUNK - 1;
 
-    if (accountId) totalsQ = totalsQ.eq("account_id", accountId);
-    if (type) totalsQ = totalsQ.eq("type", type);
+      let tq = supabase
+        .from("transactions")
+        .select("amount,type", { count: "exact" });
 
-    if (uncategorized) totalsQ = totalsQ.is("category_id", null);
-    else if (categoryId) totalsQ = totalsQ.eq("category_id", categoryId);
+      tq = applyCommonFilters(tq);
 
-    if (q) {
-      const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
-      totalsQ = totalsQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
-    }
+      const { data: part, error: partErr } = await tq.range(off, hi);
+      if (partErr) {
+        console.error("Error calculando totales (chunk):", partErr);
+        break;
+      }
 
-    const { data: allRows, error: allErr, count: allCount } = await totalsQ;
-
-    if (allErr) {
-      console.error("Totales por batch (query directa) error:", allErr);
-      totals = null;
-    } else {
-      const acc = {
-        total: 0,
-        expense: 0,
-        income: 0,
-        payment: 0,
-        transfer: 0,
-        fee: 0,
-        other: 0,
-        count: Number(allCount ?? 0),
-      };
-
-      for (const r of allRows ?? []) {
+      for (const r of part ?? []) {
         const amount = Number((r as any).amount ?? 0);
         const t = String((r as any).type ?? "other") as TransactionType | "other";
 
-        acc.total += amount;
-        if (t === "expense") acc.expense += amount;
-        else if (t === "income") acc.income += amount;
-        else if (t === "payment") acc.payment += amount;
-        else if (t === "transfer") acc.transfer += amount;
-        else if (t === "fee") acc.fee += amount;
-        else acc.other += amount;
+        totalsAcc.total += amount;
+        if (t === "expense") totalsAcc.expense += amount;
+        else if (t === "income") totalsAcc.income += amount;
+        else if (t === "payment") totalsAcc.payment += amount;
+        else if (t === "transfer") totalsAcc.transfer += amount;
+        else if (t === "fee") totalsAcc.fee += amount;
+        else totalsAcc.other += amount;
       }
-
-      totals = acc;
     }
-  } else {
-    const { data: totalsData, error: totalsErr } = await supabase.rpc("tx_totals", {
-      p_user_id: user.id,
-      p_from: fromEff ?? firstDayOfMonthISO(),
-      p_to: toEff ?? lastDayOfMonthISO(),
-      p_account_id: accountId || null,
-      p_type: type || null,
-      p_category_id: uncategorized ? null : categoryId || null,
-      p_uncategorized: uncategorized,
-      p_q: q || null,
-    });
-
-    if (totalsErr) console.error("tx_totals RPC error:", totalsErr);
-    totals = (Array.isArray(totalsData) ? totalsData[0] : null) as any;
   }
 
-  // Conteo “sin categoría” (misma base + batch + fecha secundaria)
+  // Conteo “sin categoría” (misma base)
   let uncQ = supabase
     .from("transactions")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", user.id);
+    .select("id", { count: "exact", head: true });
 
-  if (batchId) uncQ = uncQ.eq("import_batch_id", batchId);
-
-  if (!hasBatch || useDate) {
-    if (fromEff) uncQ = uncQ.gte("date", fromEff);
-    if (toEff) uncQ = uncQ.lte("date", toEff);
-  }
-
-  if (accountId) uncQ = uncQ.eq("account_id", accountId);
-  if (type) uncQ = uncQ.eq("type", type);
-
-  if (q) {
-    const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
-    uncQ = uncQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
-  }
-
-  uncQ = uncQ.is("category_id", null);
+  uncQ = applyCommonFilters(uncQ).is("category_id", null);
 
   const { count: uncategorizedCount, error: uncErr } = await uncQ;
   if (uncErr) console.error("uncategorized count error:", uncErr);
@@ -371,19 +330,21 @@ export default async function TransactionsPage(props: {
             Mostrando {rows.length} de {totalCount} (página {page} de {totalPages})
           </div>
 
+          <div className="mt-2 text-xs text-slate-300">
+            <span className="rounded-md border border-slate-700 bg-slate-950/40 px-2 py-1 inline-flex items-center">
+              Mes imputado (budget_month):{" "}
+              <span className="ml-2 text-slate-100 font-medium">
+                {fromBudget} → {toBudget}
+              </span>
+            </span>
+          </div>
+
           {selectedBatch ? (
             <div className="mt-2 text-xs text-slate-300">
               <span className="rounded-md border border-slate-700 bg-slate-950/40 px-2 py-1 inline-flex items-center">
                 Resumen seleccionado:{" "}
-                <span className="ml-2 text-slate-100 font-medium">
-                  {batchLabel(selectedBatch)}
-                </span>
+                <span className="ml-2 text-slate-100 font-medium">{batchLabel(selectedBatch)}</span>
               </span>
-              {!useDate ? (
-                <div className="mt-1 text-[11px] text-slate-400">
-                  El rango de fechas no filtra mientras haya un Resumen seleccionado (activá “Filtrar por fecha” si lo necesitás).
-                </div>
-              ) : null}
             </div>
           ) : null}
         </div>
@@ -408,28 +369,19 @@ export default async function TransactionsPage(props: {
       <div className="text-right text-sm text-slate-300">
         <div>
           Total filtro:{" "}
-          <span className="text-slate-100 font-medium">
-            {formatMoneyARS(Number(totals?.total ?? 0))}
-          </span>
+          <span className="text-slate-100 font-medium">{formatMoneyARS(Number(totalsAcc.total ?? 0))}</span>
         </div>
         <div className="text-xs text-slate-400">
-          Gastos: {formatMoneyARS(Number(totals?.expense ?? 0))} · Ingresos:{" "}
-          {formatMoneyARS(Number(totals?.income ?? 0))} · Pagos:{" "}
-          {formatMoneyARS(Number(totals?.payment ?? 0))}
+          Gastos: {formatMoneyARS(Number(totalsAcc.expense ?? 0))} · Ingresos:{" "}
+          {formatMoneyARS(Number(totalsAcc.income ?? 0))} · Pagos:{" "}
+          {formatMoneyARS(Number(totalsAcc.payment ?? 0))}
         </div>
       </div>
 
       {/* Atajo “Sin categoría” */}
       <div className="flex items-center gap-2">
         <Link
-          href={
-            basePath +
-            buildQueryString(sp, {
-              uncategorized: "1",
-              category: "",
-              page: "1",
-            })
-          }
+          href={basePath + buildQueryString(sp, { uncategorized: "1", category: "", page: "1" })}
           className="inline-flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-sm text-amber-200 hover:bg-amber-500/15"
         >
           Sin categoría
@@ -458,6 +410,7 @@ export default async function TransactionsPage(props: {
             defaultValue={fromUi}
             className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
           />
+          <div className="mt-1 text-[11px] text-slate-400">Filtra por mes imputado (budget_month).</div>
         </div>
 
         <div className="md:col-span-2">
@@ -502,24 +455,8 @@ export default async function TransactionsPage(props: {
             ))}
           </select>
           <div className="mt-1 text-[11px] text-slate-400">
-            Consejo: cargá <span className="text-slate-200">Vencimiento</span> y{" "}
-            <span className="text-slate-200">Nota</span> al importar para poder encontrarlo luego.
+            El mes imputado de un resumen se calcula por su <span className="text-slate-200">vencimiento</span>.
           </div>
-        </div>
-
-        {/* Fecha secundaria: sólo tiene efecto si hay batch y se activa */}
-        <div className="md:col-span-2 flex items-center gap-2">
-          <input
-            id="useDate"
-            type="checkbox"
-            name="useDate"
-            value="1"
-            defaultChecked={useDate}
-            className="h-4 w-4 accent-emerald-500"
-          />
-          <label htmlFor="useDate" className="text-sm text-slate-200">
-            Filtrar por fecha
-          </label>
         </div>
 
         <div className="md:col-span-2">
@@ -619,7 +556,9 @@ export default async function TransactionsPage(props: {
 
       {/* Paginación */}
       <div className="flex items-center justify-between">
-        <div className="text-xs text-slate-400">Página {page} de {totalPages}</div>
+        <div className="text-xs text-slate-400">
+          Página {page} de {totalPages}
+        </div>
 
         <div className="flex gap-2">
           <Link

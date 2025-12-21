@@ -1,3 +1,4 @@
+// AppSidebar.tsx
 "use client";
 
 import Link from "next/link";
@@ -5,10 +6,11 @@ import { usePathname } from "next/navigation";
 
 const items = [
   { href: "/protected/transactions", label: "Transacciones" },
-  { href: "/protected/transactions/new", label: "Nueva transacción" }, // ✅ nuevo
   { href: "/protected/transactions/import-pdf", label: "Importar PDF" },
+  { href: "/protected/transactions/new", label: "Nueva transacción" }, // ✅ nuevo (altas manuales)
   { href: "/protected/reports", label: "Visualizaciones" },
-  { href: "/protected/categories", label: "Categorías" }, // (si ya lo tenés implementado)
+  { href: "/protected/categories", label: "Categorías" },
+  { href: "/protected/accounts", label: "Cuentas" }, // ✅ nuevo
 ];
 
 function isActive(pathname: string, href: string) {

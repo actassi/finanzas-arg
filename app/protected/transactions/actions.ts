@@ -97,6 +97,34 @@ function sha256Hex(buf: Buffer): string {
 }
 
 /**
+ * Convierte YYYY-MM-DD a YYYY-MM-01 (date) para budget_month.
+ */
+function monthStartISO(isoDate: string): string {
+  // isoDate validado previamente con isoDateOrNull o proviene de parser (YYYY-MM-DD)
+  return `${isoDate.slice(0, 7)}-01`;
+}
+
+/**
+ * El budget_month “fuente de verdad”:
+ * - Para resumen TC: idealmente por due_date del batch.
+ * - Fallback si no hay due_date (para no romper importaciones antiguas/sin metadata).
+ */
+function resolveBudgetMonthForBatch(input: {
+  dueDate: string | null;
+  statementPeriodEnd: string | null;
+  cutOffDate: string | null;
+  firstTxDateFallback: string; // YYYY-MM-DD (por ejemplo rows[0].date)
+}): string {
+  const base =
+    input.dueDate ??
+    input.statementPeriodEnd ??
+    input.cutOffDate ??
+    input.firstTxDateFallback;
+
+  return monthStartISO(base);
+}
+
+/**
  * IMPORT PDF
  */
 export async function importTransactionsFromPdf(formData: FormData) {
@@ -121,8 +149,7 @@ export async function importTransactionsFromPdf(formData: FormData) {
   if (!(file instanceof File)) throw new Error('Falta el archivo PDF.');
   if (file.type && file.type !== 'application/pdf') throw new Error('El archivo no es un PDF.');
 
-  // Metadata opcional del statement (para “Vencimiento Noviembre 2025”, etc.)
-  // Estos nombres de campos los podés agregar al <form> cuando quieras.
+  // Metadata opcional del statement
   const provider = cleanTextOrNull(formData.get('provider')) ?? 'VISA';
   const institution = cleanTextOrNull(formData.get('institution')) ?? null;
   const note = cleanTextOrNull(formData.get('note')) ?? null;
@@ -176,8 +203,6 @@ export async function importTransactionsFromPdf(formData: FormData) {
     .single();
 
   if (batchErr) {
-    // Si usaste unique index por sha256, esta es la forma “limpia” de detectar duplicados
-    // (Postgres unique_violation = 23505)
     const code = (batchErr as any)?.code;
     if (code === '23505') {
       console.warn('PDF duplicado detectado (sha256). Abortando import:', file.name);
@@ -189,6 +214,14 @@ export async function importTransactionsFromPdf(formData: FormData) {
   }
 
   const importBatchId = batch.id;
+
+  // ✅ budget_month por vencimiento del resumen (due_date), con fallback
+  const budgetMonthForBatch = resolveBudgetMonthForBatch({
+    dueDate,
+    statementPeriodEnd: periodEnd,
+    cutOffDate,
+    firstTxDateFallback: rows[0].date, // parser: YYYY-MM-DD
+  });
 
   // 2) Armar inserts con import_batch_id real
   const inserts = rows.map((r) => {
@@ -204,7 +237,11 @@ export async function importTransactionsFromPdf(formData: FormData) {
     return {
       user_id: user.id,
       account_id: accountId,
-      date: r.date, // YYYY-MM-DD
+
+      date: r.date, // YYYY-MM-DD (fecha del consumo/movimiento)
+      // ✅ budget_month: mes de presupuesto (para TC: vence el resumen)
+      budget_month: budgetMonthForBatch,
+      due_date: dueDate, // ✅ clave para budget_month por vencimiento
       description_raw: r.description,
       merchant_name: type === 'payment' ? null : finalMerchantName,
       category_id: type === 'payment' ? null : category_id,
@@ -226,8 +263,7 @@ export async function importTransactionsFromPdf(formData: FormData) {
   if (insErr) {
     console.error('Supabase insert error:', insErr);
 
-    // Cleanup best-effort: si falló insertar transactions, no dejamos batch “huérfano”
-    // (si ya insertaste algo parcial, esto no revierte; pero en tu caso inserts es una sola llamada).
+    // Cleanup best-effort
     try {
       await supabase.from('import_batches').delete().eq('id', importBatchId).eq('user_id', user.id);
     } catch (e) {
@@ -280,8 +316,6 @@ export async function updateTransactionInline(input: {
   };
 
   if (input.applyToSimilar) {
-    // "similares" = mismo account + mismo merchant_name (si existe),
-    // si merchant_name es null, entonces merchant_name NULL + mismo description_raw.
     let q = supabase
       .from('transactions')
       .update(patch)
@@ -312,7 +346,7 @@ export async function updateTransactionInline(input: {
     }
   }
 
-  // LINK GLOBAL: Merchant → Categoría en merchant_rules (para futuros imports/autocategorización)
+  // LINK GLOBAL: Merchant → Categoría en merchant_rules
   if (merchantName && categoryId) {
     const { error: ruleErr } = await supabase
       .from('merchant_rules')
@@ -335,8 +369,7 @@ export async function updateTransactionInline(input: {
       );
     }
   }
-
-    revalidatePath('/protected/transactions');
+  revalidatePath('/protected/transactions');
   revalidatePath('/protected/transactions/import-pdf');
   revalidatePath('/protected/reports');
 }
@@ -351,38 +384,40 @@ export async function createTransaction(formData: FormData) {
 
   if (userError) {
     console.error(userError);
-    throw new Error('No se pudo validar la sesión.');
+    throw new Error("No se pudo validar la sesión.");
   }
-  if (!user) redirect('/auth/login');
+  if (!user) redirect("/auth/login");
 
-  const accountId = String(formData.get('account_id') ?? '').trim();
-  const date = isoDateOrNull(formData.get('date'), 'date');
-  const descriptionRaw = String(formData.get('description_raw') ?? '').trim();
-  const amountRaw = String(formData.get('amount') ?? '').trim();
-  const type = String(formData.get('type') ?? 'expense').trim() as TransactionType;
+  const accountId = String(formData.get("account_id") ?? "").trim();
+  const date = isoDateOrNull(formData.get("date"), "date");
+  const dueDate = isoDateOrNull(formData.get("due_date"), "due_date"); // opcional
+  const descriptionRaw = String(formData.get("description_raw") ?? "").trim();
+  const amountRaw = String(formData.get("amount") ?? "").trim();
+  const type = String(formData.get("type") ?? "expense").trim() as TransactionType;
 
-  const merchantNameInput = cleanTextOrNull(formData.get('merchant_name'));
-  const categoryIdInput = cleanTextOrNull(formData.get('category_id'));
-  const saveRule = String(formData.get('save_rule') ?? '') === '1';
+  const merchantNameInput = cleanTextOrNull(formData.get("merchant_name"));
+  const categoryIdInput = cleanTextOrNull(formData.get("category_id"));
+  const saveRule = String(formData.get("save_rule") ?? "") === "1";
 
-  if (!accountId) throw new Error('Falta account_id.');
-  if (!date) throw new Error('Falta date.');
-  if (!descriptionRaw) throw new Error('Falta description_raw.');
-  if (!amountRaw) throw new Error('Falta amount.');
+  if (!accountId) throw new Error("Falta account_id.");
+  if (!date) throw new Error("Falta date.");
+  if (!descriptionRaw) throw new Error("Falta description_raw.");
+  if (!amountRaw) throw new Error("Falta amount.");
 
   const amountNum = Number(amountRaw);
   if (!Number.isFinite(amountNum) || amountNum === 0) {
-    throw new Error('Monto inválido (debe ser numérico y distinto de 0).');
+    throw new Error("Monto inválido (debe ser numérico y distinto de 0).");
   }
 
-  const isPayment = type === 'payment';
+  const isPayment = type === "payment";
   const finalMerchantName = isPayment ? null : (merchantNameInput ?? descriptionRaw);
   const finalCategoryId = isPayment ? null : categoryIdInput;
 
-  const { error: insErr } = await supabase.from('transactions').insert({
+  const { error: insErr } = await supabase.from("transactions").insert({
     user_id: user.id,
     account_id: accountId,
     date,
+    due_date: dueDate, // si no viene, queda NULL
     description_raw: descriptionRaw,
     merchant_name: finalMerchantName,
     category_id: finalCategoryId,
@@ -392,34 +427,41 @@ export async function createTransaction(formData: FormData) {
   });
 
   if (insErr) {
-    console.error('createTransaction insert error:', insErr);
-    throw new Error('Error insertando la transacción.');
+    console.error("createTransaction insert error:", insErr);
+
+    // Esto te va a decir EXACTAMENTE por qué falla (RLS, columna inexistente, etc.)
+    const parts = [
+      insErr.message,
+      (insErr as any).details,
+      (insErr as any).hint,
+      (insErr as any).code ? `code=${(insErr as any).code}` : null,
+    ].filter(Boolean);
+
+    throw new Error(`Error insertando la transacción: ${parts.join(" | ")}`);
   }
 
   if (saveRule && !isPayment && finalMerchantName && finalCategoryId) {
     const { error: ruleErr } = await supabase
-      .from('merchant_rules')
+      .from("merchant_rules")
       .upsert(
         {
           user_id: user.id,
           pattern: finalMerchantName,
-          match_type: 'equals',
+          match_type: "equals",
           merchant_name: finalMerchantName,
           category_id: finalCategoryId,
           priority: 1000,
         },
-        { onConflict: 'user_id,match_type,pattern' }
+        { onConflict: "user_id,match_type,pattern" }
       );
 
-    if (ruleErr) {
-      // No abortamos: la transacción ya quedó guardada
-      console.error('createTransaction merchant_rules upsert error:', ruleErr);
-    }
+    // No abortamos: la transacción ya quedó guardada
+    if (ruleErr) console.error("createTransaction merchant_rules upsert error:", ruleErr);
   }
 
-  revalidatePath('/protected/transactions');
-  revalidatePath('/protected/reports');
-  revalidatePath('/protected/transactions/new');
+  revalidatePath("/protected/transactions");
+  revalidatePath("/protected/reports");
+  revalidatePath("/protected/transactions/new");
 
-  redirect('/protected/transactions/new?saved=1');
+  redirect("/protected/transactions/new?saved=1");
 }

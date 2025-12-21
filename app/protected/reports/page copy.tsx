@@ -29,9 +29,7 @@ type ImportBatchRow = {
 };
 
 function fmtArs(n: number) {
-  return new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS" }).format(
-    Number(n || 0)
-  );
+  return new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS" }).format(Number(n || 0));
 }
 
 function getParam(sp: SearchParams, key: string): string | undefined {
@@ -61,7 +59,8 @@ function startOfMonthISO(isoDate: string) {
 function endOfMonthISO(isoDate: string, tz: string) {
   const y = Number(isoDate.slice(0, 4));
   const m0 = Number(isoDate.slice(5, 7)) - 1; // 0-11
-  const d = new Date(Date.UTC(y, m0 + 1, 0, 12, 0, 0)); // último día del mes (a mediodía UTC)
+  // Usamos 12:00 UTC para evitar cruzar de día al formatear en TZ
+  const d = new Date(Date.UTC(y, m0 + 1, 0, 12, 0, 0)); // día 0 del mes siguiente => último día del mes actual
   return getLocalISODate(tz, d);
 }
 
@@ -99,6 +98,10 @@ export default async function ReportsPage(props: {
   const defaultFrom = startOfMonthISO(today);
   const defaultTo = endOfMonthISO(today, tz);
 
+  // Inputs “como en Transacciones”
+  const fromInput = getParam(sp, "from") ?? defaultFrom;
+  const toInput = getParam(sp, "to") ?? defaultTo;
+
   const accountRaw = (getParam(sp, "account") ?? "").trim();
   const accountId = accountRaw ? accountRaw : "";
 
@@ -124,7 +127,7 @@ export default async function ReportsPage(props: {
       .eq("user_id", user.id)
       .order("created_at", { ascending: false })
       .limit(80),
-    // ✅ IMPORTANTE: traemos color (NO cambiamos la lógica de colores)
+    // ✅ IMPORTANTE: traemos color
     supabase
       .from("categories")
       .select("id,name,subcategory,color")
@@ -157,25 +160,22 @@ export default async function ReportsPage(props: {
   }
 
   /**
-   * NUEVO ALCANCE: budget_month
-   * - Reportes filtran por budget_month (mes imputado) igual que Transacciones.
-   * - Si hay batch seleccionado y tiene due_date: sugerimos ese mes en los inputs.
+   * Modo efectivo (igual a Transacciones):
+   * - Si hay batch seleccionado => “Resumen” manda (ignora fechas)
+   * - Si NO hay batch => se usa from/to
    */
-  const fromRaw = (getParam(sp, "from") ?? "").trim();
-  const toRaw = (getParam(sp, "to") ?? "").trim();
-
-  const batchDue = selectedBatch?.due_date ?? "";
-  const suggestedFromUi = batchDue ? startOfMonthISO(batchDue) : "";
-  const suggestedToUi = batchDue ? endOfMonthISO(batchDue, tz) : "";
-
-  const fromInput = fromRaw || suggestedFromUi || defaultFrom;
-  const toInput = toRaw || suggestedToUi || defaultTo;
-
-  // Filtro efectivo por budget_month (YYYY-MM-01)
-  const fromBudget = startOfMonthISO(fromInput);
-  const toBudget = startOfMonthISO(toInput);
-
   const mode: "statement" | "dates" = selectedBatch ? "statement" : "dates";
+
+  // Período “mostrado” (informativo)
+  const effFrom =
+    mode === "statement"
+      ? (selectedBatch?.statement_period_start ?? selectedBatch?.cut_off_date ?? fromInput)
+      : fromInput;
+
+  const effTo =
+    mode === "statement"
+      ? (selectedBatch?.statement_period_end ?? selectedBatch?.due_date ?? toInput)
+      : toInput;
 
   // KPIs / Rankings
   let kpi = {
@@ -190,109 +190,139 @@ export default async function ReportsPage(props: {
     uncategorizedCount: 0,
   };
 
-  let byCatList: Array<{
-    category_id: string | null;
-    category_name: string;
-    total_amount: number;
-    tx_count: number;
-  }> = [];
-
+  let byCatList: Array<{ category_id: string | null; category_name: string; total_amount: number; tx_count: number }> = [];
   let byMerList: Array<{ merchant_name: string; total_amount: number; tx_count: number }> = [];
 
-  // Base filter (igual que Transactions: budget_month + account + batch)
-  const applyBase = (q0: any) => {
-    let qx = q0
+  if (mode === "dates") {
+    // Fechas (RPCs)
+    const { data: totals, error: totalsErr } = await supabase.rpc("tx_totals", {
+      p_from: effFrom,
+      p_to: effTo,
+      p_account_id: accountId ? accountId : null,
+      p_types: null,
+    });
+
+    const { data: byCat, error: byCatErr } = await supabase.rpc("tx_by_category", {
+      p_from: effFrom,
+      p_to: effTo,
+      p_account_id: accountId ? accountId : null,
+      p_types: ["expense", "fee"],
+      p_limit: 12,
+    });
+
+    const { data: byMer, error: byMerErr } = await supabase.rpc("tx_by_merchant", {
+      p_from: effFrom,
+      p_to: effTo,
+      p_account_id: accountId ? accountId : null,
+      p_types: ["expense", "fee"],
+      p_limit: 10,
+    });
+
+    if (totalsErr) console.error("tx_totals error:", totalsErr);
+    if (byCatErr) console.error("tx_by_category error:", byCatErr);
+    if (byMerErr) console.error("tx_by_merchant error:", byMerErr);
+
+    const t0 = totals?.[0];
+    kpi = {
+      total: Number(t0?.total_amount ?? 0),
+      expense: Number(t0?.expense_amount ?? 0),
+      income: Number(t0?.income_amount ?? 0),
+      payment: Number(t0?.payment_amount ?? 0),
+      fee: Number(t0?.fee_amount ?? 0),
+      transfer: Number(t0?.transfer_amount ?? 0),
+      uncategorizedAmount: Number(t0?.uncategorized_amount ?? 0),
+      txCount: Number(t0?.tx_count ?? 0),
+      uncategorizedCount: Number(t0?.uncategorized_count ?? 0),
+    };
+
+    byCatList = (byCat ?? []).map((r: any) => ({
+      category_id: (r.category_id as string | null) ?? null,
+      category_name: String(r.category_name ?? "Sin categoría"),
+      total_amount: Number(r.total_amount ?? 0),
+      tx_count: Number(r.tx_count ?? 0),
+    }));
+
+    byMerList = (byMer ?? []).map((r: any) => ({
+      merchant_name: String(r.merchant_name ?? "Sin merchant"),
+      total_amount: Number(r.total_amount ?? 0),
+      tx_count: Number(r.tx_count ?? 0),
+    }));
+  } else {
+    // Resumen (batch): query directa por import_batch_id (sin fechas)
+    let q = supabase
+      .from("transactions")
+      .select("id,amount,type,category_id,merchant_name", { count: "exact" })
       .eq("user_id", user.id)
-      .gte("budget_month", fromBudget)
-      .lte("budget_month", toBudget);
+      .eq("import_batch_id", batchId)
+      .range(0, 4999);
 
-    if (accountId) qx = qx.eq("account_id", accountId);
-    if (batchId) qx = qx.eq("import_batch_id", batchId);
+    if (accountId) q = q.eq("account_id", accountId);
 
-    return qx;
-  };
+    const { data: txRows, error: txErr, count } = await q;
 
-  // Conteo total para chunking
-  const { count: totalCount, error: countErr } = await applyBase(
-    supabase.from("transactions").select("id", { head: true, count: "exact" })
-  );
+    if (txErr) console.error("Error cargando tx por batch:", txErr);
 
-  if (countErr) console.error("Count (reports) error:", countErr);
+    const rows = (txRows ?? []) as any[];
 
-  const N = Number(totalCount ?? 0);
-  kpi.txCount = N;
+    const totalsAcc = {
+      total: 0,
+      expense: 0,
+      income: 0,
+      payment: 0,
+      fee: 0,
+      transfer: 0,
+      txCount: Number(count ?? rows.length ?? 0),
+      uncategorizedAmount: 0,
+      uncategorizedCount: 0,
+    };
 
-  if (N > 0) {
-    const CHUNK = 5000;
-    const pages = Math.ceil(N / CHUNK);
-
-    const catAgg = new Map<
-      string,
-      { category_id: string | null; category_name: string; total: number; count: number }
-    >();
+    const catAgg = new Map<string, { category_id: string | null; category_name: string; total: number; count: number }>();
     const merAgg = new Map<string, { merchant_name: string; total: number; count: number }>();
 
-    for (let i = 0; i < pages; i++) {
-      const from = i * CHUNK;
-      const to = from + CHUNK - 1;
+    for (const r of rows) {
+      const amount = Number(r.amount ?? 0);
+      const type = String(r.type ?? "other");
 
-      const { data: rows, error: rowsErr } = await applyBase(
-        supabase
-          .from("transactions")
-          .select("amount,type,category_id,merchant_name")
-          .range(from, to)
-      );
+      totalsAcc.total += amount;
+      if (type === "expense") totalsAcc.expense += amount;
+      else if (type === "income") totalsAcc.income += amount;
+      else if (type === "payment") totalsAcc.payment += amount;
+      else if (type === "fee") totalsAcc.fee += amount;
+      else if (type === "transfer") totalsAcc.transfer += amount;
 
-      if (rowsErr) {
-        console.error("Error cargando transactions (reports chunk):", rowsErr);
-        break;
+      const catId: string | null = r.category_id ?? null;
+
+      if (!catId) {
+        const isOut = type === "expense" || type === "fee";
+        if (isOut) {
+          totalsAcc.uncategorizedAmount += amount;
+          totalsAcc.uncategorizedCount += 1;
+        }
       }
 
-      for (const r of rows ?? []) {
-        const amount = Number((r as any).amount ?? 0);
-        const type = String((r as any).type ?? "other");
-        const catId: string | null = (r as any).category_id ?? null;
+      // Rankings solo expense+fee
+      if (type === "expense" || type === "fee") {
+        const key = catId ?? "__null__";
+        const name = catId ? (catMap.get(catId) ?? "Categoría eliminada") : "Sin categoría";
 
-        // Totales generales (igual a UI actual)
-        kpi.total += amount;
-        if (type === "expense") kpi.expense += amount;
-        else if (type === "income") kpi.income += amount;
-        else if (type === "payment") kpi.payment += amount;
-        else if (type === "fee") kpi.fee += amount;
-        else if (type === "transfer") kpi.transfer += amount;
-
-        // Sin categoría (solo egresos)
-        if (!catId && (type === "expense" || type === "fee")) {
-          kpi.uncategorizedAmount += amount;
-          kpi.uncategorizedCount += 1;
+        const prev = catAgg.get(key);
+        if (!prev) catAgg.set(key, { category_id: catId, category_name: name, total: amount, count: 1 });
+        else {
+          prev.total += amount;
+          prev.count += 1;
         }
 
-        // Rankings: solo expense + fee
-        if (type === "expense" || type === "fee") {
-          // Categories
-          const key = catId ?? "__null__";
-          const name = catId
-            ? catMap.get(catId) ?? "Categoría eliminada"
-            : "Sin categoría";
-
-          const pc = catAgg.get(key);
-          if (!pc) catAgg.set(key, { category_id: catId, category_name: name, total: amount, count: 1 });
-          else {
-            pc.total += amount;
-            pc.count += 1;
-          }
-
-          // Merchants
-          const m = String((r as any).merchant_name ?? "").trim() || "Sin merchant";
-          const pm = merAgg.get(m);
-          if (!pm) merAgg.set(m, { merchant_name: m, total: amount, count: 1 });
-          else {
-            pm.total += amount;
-            pm.count += 1;
-          }
+        const m = String(r.merchant_name ?? "Sin merchant").trim() || "Sin merchant";
+        const pm = merAgg.get(m);
+        if (!pm) merAgg.set(m, { merchant_name: m, total: amount, count: 1 });
+        else {
+          pm.total += amount;
+          pm.count += 1;
         }
       }
     }
+
+    kpi = totalsAcc;
 
     byCatList = [...catAgg.values()]
       .sort((a, b) => b.total - a.total)
@@ -323,31 +353,21 @@ export default async function ReportsPage(props: {
     color: r.category_id ? (catColorMap.get(r.category_id) ?? null) : null,
   }));
 
-  // Links a Transacciones: incluir from/to para que el mes imputado sea el mismo
-  const txBaseParams = {
-    from: fromInput,
-    to: toInput,
-    account: accountId || undefined,
-    batch: batchId || undefined,
-  };
-
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 space-y-6">
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold text-slate-100">Visualizaciones</h1>
-
           <div className="text-sm text-slate-300">
             Modo:{" "}
             <span className="text-slate-100 font-medium">
-              {mode === "statement" ? "Resumen (PDF)" : "Por mes imputado"}
+              {mode === "statement" ? "Resumen (PDF)" : "Por fechas"}
             </span>{" "}
-            · Mes imputado:{" "}
-            <span className="text-slate-100 font-medium">{fromBudget}</span> a{" "}
-            <span className="text-slate-100 font-medium">{toBudget}</span>
+            · Período: <span className="text-slate-100 font-medium">{effFrom}</span> a{" "}
+            <span className="text-slate-100 font-medium">{effTo}</span>
           </div>
 
-          {selectedBatch ? (
+          {mode === "statement" && selectedBatch ? (
             <div className="mt-2 text-xs text-slate-300">
               <span className="rounded-md border border-slate-700 bg-slate-950/40 px-2 py-1 inline-flex items-center">
                 Resumen seleccionado:{" "}
@@ -360,7 +380,7 @@ export default async function ReportsPage(props: {
         <div className="flex gap-2">
           <Link
             className="inline-flex items-center justify-center rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-800"
-            href={buildTxHref(txBaseParams)}
+            href="/protected/transactions"
           >
             Transacciones
           </Link>
@@ -373,7 +393,7 @@ export default async function ReportsPage(props: {
         </div>
       </div>
 
-      {/* Filtros (mismo look & feel que Transacciones) */}
+      {/* Filtros (mismo “look & feel” que Transacciones) */}
       <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
         <div className="md:col-span-2">
           <label className="text-xs text-slate-300">Desde</label>
@@ -383,9 +403,6 @@ export default async function ReportsPage(props: {
             defaultValue={fromInput}
             className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
           />
-          <div className="mt-1 text-[11px] text-slate-400">
-            Filtra por budget_month (mes imputado).
-          </div>
         </div>
 
         <div className="md:col-span-2">
@@ -421,7 +438,7 @@ export default async function ReportsPage(props: {
             defaultValue={batchId}
             className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
           >
-            <option value="">(Sin resumen)</option>
+            <option value="">(Sin resumen: usa fechas)</option>
             {batches.map((b) => (
               <option key={b.id} value={b.id}>
                 {batchLabel(b)}
@@ -429,7 +446,7 @@ export default async function ReportsPage(props: {
             ))}
           </select>
           <div className="mt-1 text-[11px] text-slate-400">
-            Si el resumen tiene <span className="text-slate-200">vencimiento</span>, los inputs sugieren ese mes.
+            Si seleccionás un resumen, el período se toma del batch (las fechas quedan como referencia).
           </div>
         </div>
 
@@ -447,7 +464,11 @@ export default async function ReportsPage(props: {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         <Link
           className="rounded-lg border border-slate-800 bg-slate-900/60 p-4 hover:bg-slate-800/50 transition"
-          href={buildTxHref(txBaseParams)}
+          href={
+            mode === "statement"
+              ? buildTxHref({ batch: batchId || undefined, account: accountId || undefined })
+              : buildTxHref({ from: effFrom, to: effTo, account: accountId || undefined })
+          }
         >
           <div className="text-xs text-slate-400">Total movimientos</div>
           <div className="text-xl font-semibold text-slate-100">{kpi.txCount}</div>
@@ -498,18 +519,35 @@ export default async function ReportsPage(props: {
         <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
           <div className="flex items-center justify-between">
             <h3 className="font-semibold text-slate-100">Top categorías (expense + fee)</h3>
-            <Link className="text-sm underline text-slate-200" href={buildTxHref(txBaseParams)}>
+            <Link
+              className="text-sm underline text-slate-200"
+              href={
+                mode === "statement"
+                  ? buildTxHref({ batch: batchId || undefined, account: accountId || undefined })
+                  : buildTxHref({ from: effFrom, to: effTo, account: accountId || undefined })
+              }
+            >
               Ver transacciones
             </Link>
           </div>
 
           <div className="mt-3 space-y-2">
             {byCatList.map((r) => {
-              const href = buildTxHref({
-                ...txBaseParams,
-                category: r.category_id ?? undefined,
-                uncategorized: r.category_id ? undefined : "1",
-              });
+              const href =
+                mode === "statement"
+                  ? buildTxHref({
+                      batch: batchId || undefined,
+                      account: accountId || undefined,
+                      category: r.category_id ?? undefined,
+                      uncategorized: r.category_id ? undefined : "1",
+                    })
+                  : buildTxHref({
+                      from: effFrom,
+                      to: effTo,
+                      account: accountId || undefined,
+                      category: r.category_id ?? undefined,
+                      uncategorized: r.category_id ? undefined : "1",
+                    });
 
               return (
                 <Link
@@ -528,21 +566,33 @@ export default async function ReportsPage(props: {
               );
             })}
 
-            {!byCatList.length ? <div className="text-sm text-slate-400">Sin datos para el alcance.</div> : null}
+            {!byCatList.length ? (
+              <div className="text-sm text-slate-400">Sin datos para el período/alcance.</div>
+            ) : null}
           </div>
         </div>
 
         <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
           <div className="flex items-center justify-between">
             <h3 className="font-semibold text-slate-100">Top merchants (expense + fee)</h3>
-            <Link className="text-sm underline text-slate-200" href={buildTxHref(txBaseParams)}>
+            <Link
+              className="text-sm underline text-slate-200"
+              href={
+                mode === "statement"
+                  ? buildTxHref({ batch: batchId || undefined, account: accountId || undefined })
+                  : buildTxHref({ from: effFrom, to: effTo, account: accountId || undefined })
+              }
+            >
               Ver transacciones
             </Link>
           </div>
 
           <div className="mt-3 space-y-2">
             {byMerList.map((r) => {
-              const href = buildTxHref({ ...txBaseParams, q: r.merchant_name });
+              const href =
+                mode === "statement"
+                  ? buildTxHref({ batch: batchId || undefined, account: accountId || undefined, q: r.merchant_name })
+                  : buildTxHref({ from: effFrom, to: effTo, account: accountId || undefined, q: r.merchant_name });
 
               return (
                 <Link
@@ -561,7 +611,9 @@ export default async function ReportsPage(props: {
               );
             })}
 
-            {!byMerList.length ? <div className="text-sm text-slate-400">Sin datos para el alcance.</div> : null}
+            {!byMerList.length ? (
+              <div className="text-sm text-slate-400">Sin datos para el período/alcance.</div>
+            ) : null}
           </div>
         </div>
       </div>
