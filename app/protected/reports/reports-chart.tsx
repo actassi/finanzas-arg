@@ -16,6 +16,7 @@ type Row = {
   amount: number;
   txCount?: number;
   category_id?: string | null;
+  color?: string | null;
 };
 
 function fmtArs(n: number) {
@@ -26,37 +27,16 @@ function fmtArs(n: number) {
   }).format(Number(n || 0));
 }
 
-/**
- * Paleta pastel (sobre fondo oscuro funciona bien).
- * Si querés “más suave”, subí lightness; si querés “más vivo”, subí saturation.
- */
-const PASTEL_PALETTE = [
-  "#A7F3D0", // mint
-  "#BFDBFE", // light blue
-  "#FBCFE8", // pink
-  "#FDE68A", // warm yellow
-  "#DDD6FE", // lavender
-  "#BAE6FD", // sky
-  "#FECACA", // soft red
-  "#BBF7D0", // soft green
-  "#F9A8D4", // rose
-  "#C7D2FE", // periwinkle
-  "#99F6E4", // teal
-  "#FED7AA", // peach
-];
-
-/** Hash simple y estable para asignar color por categoría */
-function hashStringToIndex(s: string, mod: number) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) {
-    h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  }
-  return h % mod;
-}
-
-function colorForCategory(category: string) {
-  const idx = hashStringToIndex(category ?? "", PASTEL_PALETTE.length);
-  return PASTEL_PALETTE[idx];
+function isCssColor(s: string) {
+  const v = (s ?? "").trim();
+  if (!v) return false;
+  return (
+    v.startsWith("#") ||
+    v.startsWith("rgb(") ||
+    v.startsWith("rgba(") ||
+    v.startsWith("hsl(") ||
+    v.startsWith("hsla(")
+  );
 }
 
 export default function ReportsChart({ data }: { data: Row[] }) {
@@ -66,16 +46,18 @@ export default function ReportsChart({ data }: { data: Row[] }) {
     return <div className="text-sm text-muted-foreground">Sin datos para graficar.</div>;
   }
 
-  // Opcional: asegurar orden descendente por importe (si tu RPC ya lo trae así, no hace falta)
   const chartData = [...safeData].sort((a, b) => Number(b.amount ?? 0) - Number(a.amount ?? 0));
+
+  const colorFor = (r: Row) => {
+    if (r.color && isCssColor(r.color)) return r.color;
+    if (!r.category_id) return "#f59e0b"; // Sin categoría
+    return "#64748b"; // fallback (slate)
+  };
 
   return (
     <div className="h-80 w-full">
       <ResponsiveContainer>
-        <BarChart
-          data={chartData}
-          margin={{ top: 10, right: 12, left: 0, bottom: 32 }}
-        >
+        <BarChart data={chartData} margin={{ top: 10, right: 12, left: 0, bottom: 32 }}>
           <CartesianGrid strokeDasharray="3 3" opacity={0.25} />
           <XAxis
             dataKey="category"
@@ -106,8 +88,11 @@ export default function ReportsChart({ data }: { data: Row[] }) {
           />
 
           <Bar dataKey="amount" name="Importe ARS" radius={[8, 8, 0, 0]}>
-            {chartData.map((r) => (
-              <Cell key={r.category} fill={colorForCategory(r.category)} />
+            {chartData.map((r, idx) => (
+              <Cell
+                key={`${r.category_id ?? "null"}-${r.category}-${idx}`}
+                fill={colorFor(r)}
+              />
             ))}
           </Bar>
         </BarChart>

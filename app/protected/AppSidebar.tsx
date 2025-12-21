@@ -5,8 +5,10 @@ import { usePathname } from "next/navigation";
 
 const items = [
   { href: "/protected/transactions", label: "Transacciones" },
+  { href: "/protected/transactions/new", label: "Nueva transacción" }, // ✅ nuevo
   { href: "/protected/transactions/import-pdf", label: "Importar PDF" },
   { href: "/protected/reports", label: "Visualizaciones" },
+  { href: "/protected/categories", label: "Categorías" }, // (si ya lo tenés implementado)
 ];
 
 function isActive(pathname: string, href: string) {

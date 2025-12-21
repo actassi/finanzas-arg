@@ -336,7 +336,90 @@ export async function updateTransactionInline(input: {
     }
   }
 
-  revalidatePath('/protected/transactions');
+    revalidatePath('/protected/transactions');
   revalidatePath('/protected/transactions/import-pdf');
   revalidatePath('/protected/reports');
+}
+
+export async function createTransaction(formData: FormData) {
+  const supabase = await createClient();
+
+  const {
+    data: { user },
+    error: userError,
+  } = await supabase.auth.getUser();
+
+  if (userError) {
+    console.error(userError);
+    throw new Error('No se pudo validar la sesión.');
+  }
+  if (!user) redirect('/auth/login');
+
+  const accountId = String(formData.get('account_id') ?? '').trim();
+  const date = isoDateOrNull(formData.get('date'), 'date');
+  const descriptionRaw = String(formData.get('description_raw') ?? '').trim();
+  const amountRaw = String(formData.get('amount') ?? '').trim();
+  const type = String(formData.get('type') ?? 'expense').trim() as TransactionType;
+
+  const merchantNameInput = cleanTextOrNull(formData.get('merchant_name'));
+  const categoryIdInput = cleanTextOrNull(formData.get('category_id'));
+  const saveRule = String(formData.get('save_rule') ?? '') === '1';
+
+  if (!accountId) throw new Error('Falta account_id.');
+  if (!date) throw new Error('Falta date.');
+  if (!descriptionRaw) throw new Error('Falta description_raw.');
+  if (!amountRaw) throw new Error('Falta amount.');
+
+  const amountNum = Number(amountRaw);
+  if (!Number.isFinite(amountNum) || amountNum === 0) {
+    throw new Error('Monto inválido (debe ser numérico y distinto de 0).');
+  }
+
+  const isPayment = type === 'payment';
+  const finalMerchantName = isPayment ? null : (merchantNameInput ?? descriptionRaw);
+  const finalCategoryId = isPayment ? null : categoryIdInput;
+
+  const { error: insErr } = await supabase.from('transactions').insert({
+    user_id: user.id,
+    account_id: accountId,
+    date,
+    description_raw: descriptionRaw,
+    merchant_name: finalMerchantName,
+    category_id: finalCategoryId,
+    amount: signedAmount(amountNum),
+    type,
+    import_batch_id: null,
+  });
+
+  if (insErr) {
+    console.error('createTransaction insert error:', insErr);
+    throw new Error('Error insertando la transacción.');
+  }
+
+  if (saveRule && !isPayment && finalMerchantName && finalCategoryId) {
+    const { error: ruleErr } = await supabase
+      .from('merchant_rules')
+      .upsert(
+        {
+          user_id: user.id,
+          pattern: finalMerchantName,
+          match_type: 'equals',
+          merchant_name: finalMerchantName,
+          category_id: finalCategoryId,
+          priority: 1000,
+        },
+        { onConflict: 'user_id,match_type,pattern' }
+      );
+
+    if (ruleErr) {
+      // No abortamos: la transacción ya quedó guardada
+      console.error('createTransaction merchant_rules upsert error:', ruleErr);
+    }
+  }
+
+  revalidatePath('/protected/transactions');
+  revalidatePath('/protected/reports');
+  revalidatePath('/protected/transactions/new');
+
+  redirect('/protected/transactions/new?saved=1');
 }
