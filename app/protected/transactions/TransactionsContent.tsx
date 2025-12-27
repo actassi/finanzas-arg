@@ -32,6 +32,14 @@ function lastDayOfMonthISO(d = new Date()) {
   return x.toISOString().slice(0, 10);
 }
 
+/**
+ * Convierte cualquier YYYY-MM-DD al primer día de ese mes: YYYY-MM-01
+ * (Evita problemas de timezone y alinea con budget_month).
+ */
+function monthStartISO(iso: string) {
+  return `${iso.slice(0, 7)}-01`;
+}
+
 function getParam(
   sp: Record<string, string | string[] | undefined>,
   key: string
@@ -92,6 +100,14 @@ export default async function TransactionsContent(props: {
   const from = getParam(sp, "from") ?? firstDayOfMonthISO();
   const to = getParam(sp, "to") ?? lastDayOfMonthISO();
 
+  // Modo:
+  // - useDate=1 => filtra por fecha real (t.date)
+  // - default  => filtra por mes presupuestario (t.budget_month)
+  const useDate = getParam(sp, "useDate") === "1";
+
+  const fromMonth = monthStartISO(from);
+  const toMonth = monthStartISO(to);
+
   const accountId = getParam(sp, "account") ?? "";
   const type = (getParam(sp, "type") ?? "") as TransactionType | "";
   const categoryId = getParam(sp, "category") ?? "";
@@ -132,9 +148,14 @@ export default async function TransactionsContent(props: {
       "id,user_id,account_id,date,description_raw,merchant_name,category_id,amount,type,import_batch_id,created_at,receipt,installment_number,installments_total",
       { count: "exact" }
     )
-    .eq("user_id", user.id)
-    .gte("date", from)
-    .lte("date", to);
+    .eq("user_id", user.id);
+
+  // Base date filter
+  if (useDate) {
+    txQ = txQ.gte("date", from).lte("date", to);
+  } else {
+    txQ = txQ.gte("budget_month", fromMonth).lte("budget_month", toMonth);
+  }
 
   if (accountId) txQ = txQ.eq("account_id", accountId);
   if (type) txQ = txQ.eq("type", type);
@@ -159,19 +180,20 @@ export default async function TransactionsContent(props: {
   const totalPages = Math.max(Math.ceil(totalCount / per), 1);
 
   // Totales del período filtrado (RPC)
-  const { data: totalsData, error: totalsErr } = await supabase.rpc(
-    "tx_totals",
-    {
-      p_user_id: user.id,
-      p_from: from,
-      p_to: to,
-      p_account_id: accountId || null,
-      p_type: type || null,
-      p_category_id: uncategorized ? null : categoryId || null,
-      p_uncategorized: uncategorized,
-      p_q: q || null,
-    }
-  );
+  // Nota: si tus RPCs fueron ajustados para budget_month, mandamos fromMonth/toMonth en modo presupuestario.
+  const rpcFrom = useDate ? from : fromMonth;
+  const rpcTo = useDate ? to : toMonth;
+
+  const { data: totalsData, error: totalsErr } = await supabase.rpc("tx_totals", {
+    p_user_id: user.id,
+    p_from: rpcFrom,
+    p_to: rpcTo,
+    p_account_id: accountId || null,
+    p_type: type || null,
+    p_category_id: uncategorized ? null : categoryId || null,
+    p_uncategorized: uncategorized,
+    p_q: q || null,
+  });
 
   if (totalsErr) console.error("tx_totals RPC error:", totalsErr);
 
@@ -192,9 +214,13 @@ export default async function TransactionsContent(props: {
   let uncQ = supabase
     .from("transactions")
     .select("id", { count: "exact", head: true })
-    .eq("user_id", user.id)
-    .gte("date", from)
-    .lte("date", to);
+    .eq("user_id", user.id);
+
+  if (useDate) {
+    uncQ = uncQ.gte("date", from).lte("date", to);
+  } else {
+    uncQ = uncQ.gte("budget_month", fromMonth).lte("budget_month", toMonth);
+  }
 
   if (accountId) uncQ = uncQ.eq("account_id", accountId);
   if (type) uncQ = uncQ.eq("type", type);
@@ -375,6 +401,9 @@ export default async function TransactionsContent(props: {
           </select>
         </div>
 
+        {/* Mantener el modo actual al aplicar filtros */}
+        {useDate && <input type="hidden" name="useDate" value="1" />}
+
         <input type="hidden" name="page" value="1" />
 
         <div className="md:col-span-2 flex gap-2 justify-end">
@@ -398,7 +427,9 @@ export default async function TransactionsContent(props: {
 
       {/* Paginación */}
       <div className="flex items-center justify-between">
-        <div className="text-xs text-slate-400">Página {page} de {totalPages}</div>
+        <div className="text-xs text-slate-400">
+          Página {page} de {totalPages}
+        </div>
 
         <div className="flex gap-2">
           <Link
@@ -414,9 +445,7 @@ export default async function TransactionsContent(props: {
           <Link
             aria-disabled={page >= totalPages}
             className={`rounded-md border border-slate-700 px-3 py-1 text-sm ${
-              page >= totalPages
-                ? "opacity-50 pointer-events-none"
-                : "hover:bg-slate-800"
+              page >= totalPages ? "opacity-50 pointer-events-none" : "hover:bg-slate-800"
             }`}
             href={basePath + buildQueryString(sp, { page: String(page + 1) })}
           >

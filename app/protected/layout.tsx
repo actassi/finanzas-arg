@@ -36,15 +36,13 @@ export default function ProtectedLayout({ children }: { children: React.ReactNod
       {/* CONTENT */}
       <div className="flex-1 w-full px-3 lg:px-6 py-6">
         <div className="flex flex-col lg:flex-row items-start gap-6">
-          {/* Sidebar a la izquierda */}
+          {/* Sidebar */}
           <aside className="w-full lg:w-56 shrink-0 lg:sticky lg:top-24">
             <AppSidebar />
           </aside>
 
-          {/* Contenido con prioridad total */}
-          <section className="flex-1 min-w-0 w-full">
-            {children}
-          </section>
+          {/* Main */}
+          <section className="flex-1 min-w-0 w-full">{children}</section>
         </div>
       </div>
 

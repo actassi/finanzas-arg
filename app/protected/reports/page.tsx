@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import ReportsChart from "./reports-chart";
 import IncomeExpenseChart from "./income-expense-chart";
+import ReportsFiltersClient from "./ReportsFiltersClient";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
@@ -17,29 +18,38 @@ type ImportBatchRow = {
   id: string;
   user_id: string;
   account_id: string;
-  created_at: string; // timestamptz
+  created_at: string;
   provider: string | null;
   institution: string | null;
   file_name: string | null;
-  due_date: string | null; // date
-  cut_off_date: string | null; // date
-  statement_period_start: string | null; // date
-  statement_period_end: string | null; // date
+  due_date: string | null;
+  cut_off_date: string | null;
+  statement_period_start: string | null;
+  statement_period_end: string | null;
   note: string | null;
 };
 
-function fmtArs(n: number) {
-  return new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS" }).format(
-    Number(n || 0)
-  );
-}
+type TxMini = {
+  amount: number;
+  type: string;
+  category_id: string | null;
+  merchant_name: string | null;
+};
 
 function getParam(sp: SearchParams, key: string): string | undefined {
   const v = sp[key];
   return Array.isArray(v) ? v[0] : v;
 }
 
-// Fecha local ISO (tz) sin librerías externas
+function fmtArs(n: number) {
+  return new Intl.NumberFormat("es-AR", {
+    style: "currency",
+    currency: "ARS",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Number(n || 0));
+}
+
 function getLocalISODate(tz = "America/Argentina/Cordoba", d = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
@@ -47,6 +57,7 @@ function getLocalISODate(tz = "America/Argentina/Cordoba", d = new Date()) {
     month: "2-digit",
     day: "2-digit",
   }).formatToParts(d);
+
   const y = parts.find((p) => p.type === "year")?.value ?? "1970";
   const m = parts.find((p) => p.type === "month")?.value ?? "01";
   const day = parts.find((p) => p.type === "day")?.value ?? "01";
@@ -57,12 +68,19 @@ function startOfMonthISO(isoDate: string) {
   return `${isoDate.slice(0, 7)}-01`;
 }
 
-// Fin de mes en TZ (evita “off by one” por UTC)
 function endOfMonthISO(isoDate: string, tz: string) {
   const y = Number(isoDate.slice(0, 4));
-  const m0 = Number(isoDate.slice(5, 7)) - 1; // 0-11
-  const d = new Date(Date.UTC(y, m0 + 1, 0, 12, 0, 0)); // último día del mes (a mediodía UTC)
+  const m0 = Number(isoDate.slice(5, 7)) - 1;
+  const d = new Date(Date.UTC(y, m0 + 1, 0, 12, 0, 0));
   return getLocalISODate(tz, d);
+}
+
+function batchLabel(b: ImportBatchRow) {
+  const ref = b.due_date ?? (b.created_at ? b.created_at.slice(0, 10) : "");
+  const provider = b.provider ? b.provider.toUpperCase() : "PDF";
+  const note = b.note ? ` · ${b.note}` : "";
+  const file = b.file_name ? ` · ${b.file_name}` : "";
+  return `${provider} · ${ref}${note}${file}`;
 }
 
 function buildTxHref(params: Record<string, string | undefined>) {
@@ -74,17 +92,7 @@ function buildTxHref(params: Record<string, string | undefined>) {
   return qs ? `/protected/transactions?${qs}` : `/protected/transactions`;
 }
 
-function batchLabel(b: ImportBatchRow) {
-  const ref = b.due_date ?? (b.created_at ? b.created_at.slice(0, 10) : "");
-  const provider = b.provider ? b.provider.toUpperCase() : "PDF";
-  const note = b.note ? ` · ${b.note}` : "";
-  const file = b.file_name ? ` · ${b.file_name}` : "";
-  return `${provider} · ${ref}${note}${file}`;
-}
-
-export default async function ReportsPage(props: {
-  searchParams: SearchParams | Promise<SearchParams>;
-}) {
+export default async function ReportsPage(props: { searchParams: SearchParams | Promise<SearchParams> }) {
   const supabase = await createClient();
 
   const {
@@ -98,14 +106,21 @@ export default async function ReportsPage(props: {
   const today = getLocalISODate(tz);
   const defaultFrom = startOfMonthISO(today);
   const defaultTo = endOfMonthISO(today, tz);
+  const defaultBudgetMonth = today.slice(0, 7);
 
-  const accountRaw = (getParam(sp, "account") ?? "").trim();
-  const accountId = accountRaw ? accountRaw : "";
+  const from = (getParam(sp, "from") ?? defaultFrom).trim();
+  const to = (getParam(sp, "to") ?? defaultTo).trim();
 
-  const batchRaw = (getParam(sp, "batch") ?? "").trim();
-  const batchId = batchRaw ? batchRaw : "";
+  const accountId = ((getParam(sp, "account") ?? "").trim() || "") as string;
+  const batchId = ((getParam(sp, "batch") ?? "").trim() || "") as string;
+  const useDate = getParam(sp, "useDate") === "1";
 
-  // Cargar cuentas + batches + categorías (para mapear nombres + colores)
+  // ✅ nuevo
+  const budget = getParam(sp, "budget") === "1";
+  const budgetMonth = (getParam(sp, "budgetMonth") ?? defaultBudgetMonth).trim();
+  const budgetStart = `${budgetMonth}-01`;
+  const budgetEnd = endOfMonthISO(budgetStart, tz);
+
   const [
     { data: accountsData, error: accErr },
     { data: batchesData, error: batchesErr },
@@ -124,7 +139,6 @@ export default async function ReportsPage(props: {
       .eq("user_id", user.id)
       .order("created_at", { ascending: false })
       .limit(80),
-    // ✅ IMPORTANTE: traemos color (NO cambiamos la lógica de colores)
     supabase
       .from("categories")
       .select("id,name,subcategory,color")
@@ -137,184 +151,151 @@ export default async function ReportsPage(props: {
   if (catsErr) console.error("Error cargando categories:", catsErr);
 
   const accounts = (accountsData ?? []) as AccountRow[];
-
   const batchesAll = (batchesData ?? []) as ImportBatchRow[];
-  const batches = accountId ? batchesAll.filter((b) => b.account_id === accountId) : batchesAll;
-  const selectedBatch = batchId ? batchesAll.find((b) => b.id === batchId) ?? null : null;
 
-  // Map id -> "Nombre / Sub" + Map id -> color
+  // Map categoría -> nombre + color
   const catMap = new Map<string, string>();
   const catColorMap = new Map<string, string>();
-
   for (const c of catsData ?? []) {
     const id = String((c as any).id);
     const name = String((c as any).name ?? "");
     const sub = String((c as any).subcategory ?? "").trim();
     const color = String((c as any).color ?? "").trim();
-
     catMap.set(id, sub ? `${name} / ${sub}` : name);
     if (color) catColorMap.set(id, color);
   }
 
-  /**
-   * NUEVO ALCANCE: budget_month
-   * - Reportes filtran por budget_month (mes imputado) igual que Transacciones.
-   * - Si hay batch seleccionado y tiene due_date: sugerimos ese mes en los inputs.
-   */
-  const fromRaw = (getParam(sp, "from") ?? "").trim();
-  const toRaw = (getParam(sp, "to") ?? "").trim();
+  // ✅ batches del mes (por due_date) para presupuesto mensual
+  let budgetBatchIds: string[] = [];
+  if (budget) {
+    let qb = supabase
+      .from("import_batches")
+      .select("id")
+      .eq("user_id", user.id)
+      .gte("due_date", budgetStart)
+      .lte("due_date", budgetEnd)
+      .limit(500);
+    if (accountId) qb = qb.eq("account_id", accountId);
 
-  const batchDue = selectedBatch?.due_date ?? "";
-  const suggestedFromUi = batchDue ? startOfMonthISO(batchDue) : "";
-  const suggestedToUi = batchDue ? endOfMonthISO(batchDue, tz) : "";
+    const { data: idRows, error: idErr } = await qb;
+    if (idErr) console.error("Error buscando batches para presupuesto mensual:", idErr);
+    budgetBatchIds = (idRows ?? []).map((r: any) => String(r.id));
+  }
 
-  const fromInput = fromRaw || suggestedFromUi || defaultFrom;
-  const toInput = toRaw || suggestedToUi || defaultTo;
+  const applyFilters = (q0: any) => {
+    let qx = q0.eq("user_id", user.id);
 
-  // Filtro efectivo por budget_month (YYYY-MM-01)
-  const fromBudget = startOfMonthISO(fromInput);
-  const toBudget = startOfMonthISO(toInput);
+    if (budget) {
+      if (budgetBatchIds.length > 0) {
+        const inList = budgetBatchIds.join(",");
+        qx = qx.or(
+          `import_batch_id.in.(${inList}),and(import_batch_id.is.null,date.gte.${budgetStart},date.lte.${budgetEnd})`
+        );
+      } else {
+        qx = qx.is("import_batch_id", null).gte("date", budgetStart).lte("date", budgetEnd);
+      }
+      // ignora batchId/useDate
+    } else {
+      if (!useDate) {
+        if (batchId) qx = qx.eq("import_batch_id", batchId);
+      } else {
+        qx = qx.gte("date", from).lte("date", to);
+        if (batchId) qx = qx.eq("import_batch_id", batchId);
+        else qx = qx.is("import_batch_id", null);
+      }
+    }
 
-  const mode: "statement" | "dates" = selectedBatch ? "statement" : "dates";
+    if (accountId) qx = qx.eq("account_id", accountId);
+    return qx;
+  };
 
-  // KPIs / Rankings
-  let kpi = {
+  // count total
+  let countQ = supabase.from("transactions").select("id", { count: "exact", head: true });
+  countQ = applyFilters(countQ);
+  const { count: totalCount, error: countErr } = await countQ;
+  if (countErr) console.error("Error count transactions:", countErr);
+
+  const kpi = {
     total: 0,
     expense: 0,
     income: 0,
     payment: 0,
     fee: 0,
     transfer: 0,
-    txCount: 0,
+    other: 0,
+    txCount: Number(totalCount ?? 0),
     uncategorizedAmount: 0,
     uncategorizedCount: 0,
   };
 
-  let byCatList: Array<{
-    category_id: string | null;
-    category_name: string;
-    total_amount: number;
-    tx_count: number;
-  }> = [];
+  const byCat = new Map<string, { amount: number; count: number }>();
+  const byMer = new Map<string, { amount: number; count: number }>();
 
-  let byMerList: Array<{ merchant_name: string; total_amount: number; tx_count: number }> = [];
+  const CHUNK = 5000;
+  const pages = Math.ceil((totalCount ?? 0) / CHUNK);
 
-  // Base filter (igual que Transactions: budget_month + account + batch)
-  const applyBase = (q0: any) => {
-    let qx = q0
-      .eq("user_id", user.id)
-      .gte("budget_month", fromBudget)
-      .lte("budget_month", toBudget);
+  for (let i = 0; i < pages; i++) {
+    const off = i * CHUNK;
+    const hi = off + CHUNK - 1;
 
-    if (accountId) qx = qx.eq("account_id", accountId);
-    if (batchId) qx = qx.eq("import_batch_id", batchId);
+    let qx = supabase.from("transactions").select("amount,type,category_id,merchant_name").range(off, hi);
+    qx = applyFilters(qx);
 
-    return qx;
-  };
+    const { data: part, error: partErr } = await qx;
+    if (partErr) {
+      console.error("Error agregando (chunk):", partErr);
+      break;
+    }
 
-  // Conteo total para chunking
-  const { count: totalCount, error: countErr } = await applyBase(
-    supabase.from("transactions").select("id", { head: true, count: "exact" })
-  );
+    for (const r0 of (part ?? []) as any[]) {
+      const r = r0 as TxMini;
+      const amt = Number(r.amount ?? 0);
+      const t = String(r.type ?? "other");
 
-  if (countErr) console.error("Count (reports) error:", countErr);
+      kpi.total += amt;
+      if (t === "expense") kpi.expense += amt;
+      else if (t === "income") kpi.income += amt;
+      else if (t === "payment") kpi.payment += amt;
+      else if (t === "transfer") kpi.transfer += amt;
+      else if (t === "fee") kpi.fee += amt;
+      else kpi.other += amt;
 
-  const N = Number(totalCount ?? 0);
-  kpi.txCount = N;
-
-  if (N > 0) {
-    const CHUNK = 5000;
-    const pages = Math.ceil(N / CHUNK);
-
-    const catAgg = new Map<
-      string,
-      { category_id: string | null; category_name: string; total: number; count: number }
-    >();
-    const merAgg = new Map<string, { merchant_name: string; total: number; count: number }>();
-
-    for (let i = 0; i < pages; i++) {
-      const from = i * CHUNK;
-      const to = from + CHUNK - 1;
-
-      const { data: rows, error: rowsErr } = await applyBase(
-        supabase
-          .from("transactions")
-          .select("amount,type,category_id,merchant_name")
-          .range(from, to)
-      );
-
-      if (rowsErr) {
-        console.error("Error cargando transactions (reports chunk):", rowsErr);
-        break;
-      }
-
-      for (const r of rows ?? []) {
-        const amount = Number((r as any).amount ?? 0);
-        const type = String((r as any).type ?? "other");
-        const catId: string | null = (r as any).category_id ?? null;
-
-        // Totales generales (igual a UI actual)
-        kpi.total += amount;
-        if (type === "expense") kpi.expense += amount;
-        else if (type === "income") kpi.income += amount;
-        else if (type === "payment") kpi.payment += amount;
-        else if (type === "fee") kpi.fee += amount;
-        else if (type === "transfer") kpi.transfer += amount;
-
-        // Sin categoría (solo egresos)
-        if (!catId && (type === "expense" || type === "fee")) {
-          kpi.uncategorizedAmount += amount;
+      const isEgreso = t === "expense" || t === "fee";
+      if (isEgreso) {
+        if (!r.category_id) {
+          kpi.uncategorizedAmount += amt;
           kpi.uncategorizedCount += 1;
         }
 
-        // Rankings: solo expense + fee
-        if (type === "expense" || type === "fee") {
-          // Categories
-          const key = catId ?? "__null__";
-          const name = catId
-            ? catMap.get(catId) ?? "Categoría eliminada"
-            : "Sin categoría";
+        const catKey = r.category_id ?? "null";
+        const prevC = byCat.get(catKey) ?? { amount: 0, count: 0 };
+        prevC.amount += amt;
+        prevC.count += 1;
+        byCat.set(catKey, prevC);
 
-          const pc = catAgg.get(key);
-          if (!pc) catAgg.set(key, { category_id: catId, category_name: name, total: amount, count: 1 });
-          else {
-            pc.total += amount;
-            pc.count += 1;
-          }
-
-          // Merchants
-          const m = String((r as any).merchant_name ?? "").trim() || "Sin merchant";
-          const pm = merAgg.get(m);
-          if (!pm) merAgg.set(m, { merchant_name: m, total: amount, count: 1 });
-          else {
-            pm.total += amount;
-            pm.count += 1;
-          }
-        }
+        const merName = String(r.merchant_name ?? "—").trim() || "—";
+        const prevM = byMer.get(merName) ?? { amount: 0, count: 0 };
+        prevM.amount += amt;
+        prevM.count += 1;
+        byMer.set(merName, prevM);
       }
     }
-
-    byCatList = [...catAgg.values()]
-      .sort((a, b) => b.total - a.total)
-      .slice(0, 12)
-      .map((x) => ({
-        category_id: x.category_id,
-        category_name: x.category_name,
-        total_amount: x.total,
-        tx_count: x.count,
-      }));
-
-    byMerList = [...merAgg.values()]
-      .sort((a, b) => b.total - a.total)
-      .slice(0, 10)
-      .map((x) => ({
-        merchant_name: x.merchant_name,
-        total_amount: x.total,
-        tx_count: x.count,
-      }));
   }
 
-  // ✅ Agregamos color sin cambiar la interfaz de ReportsChart
+  const byCatList = Array.from(byCat.entries())
+    .map(([key, v]) => {
+      const category_id = key === "null" ? null : key;
+      const category_name = category_id ? catMap.get(category_id) ?? "Sin categoría" : "Sin categoría";
+      return { category_id, category_name, total_amount: v.amount, tx_count: v.count };
+    })
+    .sort((a, b) => b.total_amount - a.total_amount)
+    .slice(0, 12);
+
+  const byMerList = Array.from(byMer.entries())
+    .map(([merchant_name, v]) => ({ merchant_name, total_amount: v.amount, tx_count: v.count }))
+    .sort((a, b) => b.total_amount - a.total_amount)
+    .slice(0, 10);
+
   const categoryChartData = byCatList.map((r) => ({
     category: r.category_name,
     amount: r.total_amount,
@@ -323,12 +304,17 @@ export default async function ReportsPage(props: {
     color: r.category_id ? (catColorMap.get(r.category_id) ?? null) : null,
   }));
 
-  // Links a Transacciones: incluir from/to para que el mes imputado sea el mismo
-  const txBaseParams = {
-    from: fromInput,
-    to: toInput,
+  // Links a transacciones: preserva presupuesto mensual si está activo
+  const txBaseParams: Record<string, string | undefined> = {
     account: accountId || undefined,
-    batch: batchId || undefined,
+
+    budget: budget ? "1" : undefined,
+    budgetMonth: budget ? budgetMonth : undefined,
+
+    batch: !budget ? (batchId || undefined) : undefined,
+    useDate: !budget && useDate ? "1" : undefined,
+    from: !budget && useDate ? from : undefined,
+    to: !budget && useDate ? to : undefined,
   };
 
   return (
@@ -336,25 +322,20 @@ export default async function ReportsPage(props: {
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold text-slate-100">Visualizaciones</h1>
-
           <div className="text-sm text-slate-300">
-            Modo:{" "}
+            Alcance:{" "}
             <span className="text-slate-100 font-medium">
-              {mode === "statement" ? "Resumen (PDF)" : "Por mes imputado"}
-            </span>{" "}
-            · Mes imputado:{" "}
-            <span className="text-slate-100 font-medium">{fromBudget}</span> a{" "}
-            <span className="text-slate-100 font-medium">{toBudget}</span>
+              {budget
+                ? `Presupuesto mensual (${budgetMonth})`
+                : !useDate && !batchId
+                ? "Todas las transacciones"
+                : !useDate && batchId
+                ? "Resumen (completo)"
+                : useDate && !batchId
+                ? "Manual (por fecha)"
+                : "Resumen (por fecha)"}
+            </span>
           </div>
-
-          {selectedBatch ? (
-            <div className="mt-2 text-xs text-slate-300">
-              <span className="rounded-md border border-slate-700 bg-slate-950/40 px-2 py-1 inline-flex items-center">
-                Resumen seleccionado:{" "}
-                <span className="ml-2 text-slate-100 font-medium">{batchLabel(selectedBatch)}</span>
-              </span>
-            </div>
-          ) : null}
         </div>
 
         <div className="flex gap-2">
@@ -373,75 +354,17 @@ export default async function ReportsPage(props: {
         </div>
       </div>
 
-      {/* Filtros (mismo look & feel que Transacciones) */}
-      <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
-        <div className="md:col-span-2">
-          <label className="text-xs text-slate-300">Desde</label>
-          <input
-            type="date"
-            name="from"
-            defaultValue={fromInput}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          />
-          <div className="mt-1 text-[11px] text-slate-400">
-            Filtra por budget_month (mes imputado).
-          </div>
-        </div>
-
-        <div className="md:col-span-2">
-          <label className="text-xs text-slate-300">Hasta</label>
-          <input
-            type="date"
-            name="to"
-            defaultValue={toInput}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          />
-        </div>
-
-        <div className="md:col-span-3">
-          <label className="text-xs text-slate-300">Cuenta</label>
-          <select
-            name="account"
-            defaultValue={accountId}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            <option value="">Todas</option>
-            {accounts.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name} ({a.currency})
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="md:col-span-5">
-          <label className="text-xs text-slate-300">Resumen (PDF importado)</label>
-          <select
-            name="batch"
-            defaultValue={batchId}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            <option value="">(Sin resumen)</option>
-            {batches.map((b) => (
-              <option key={b.id} value={b.id}>
-                {batchLabel(b)}
-              </option>
-            ))}
-          </select>
-          <div className="mt-1 text-[11px] text-slate-400">
-            Si el resumen tiene <span className="text-slate-200">vencimiento</span>, los inputs sugieren ese mes.
-          </div>
-        </div>
-
-        <div className="md:col-span-12 flex justify-end gap-2">
-          <button
-            type="submit"
-            className="inline-flex items-center justify-center rounded-md bg-emerald-500 px-4 py-1.5 text-sm font-medium text-slate-950 hover:bg-emerald-400"
-          >
-            Aplicar
-          </button>
-        </div>
-      </form>
+      <ReportsFiltersClient
+        accounts={accounts.map((a) => ({ id: a.id, name: a.name, currency: a.currency }))}
+        batches={batchesAll.map((b) => ({
+          id: b.id,
+          account_id: b.account_id,
+          label: batchLabel(b),
+          due_date: b.due_date,
+          cut_off_date: b.cut_off_date,
+        }))}
+        initial={{ from, to, accountId, batchId, useDate, budget, budgetMonth }}
+      />
 
       {/* KPIs */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">

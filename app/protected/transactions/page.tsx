@@ -1,15 +1,15 @@
-// app/(protected)/transactions/page.tsx
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import type { Account, Category, TransactionType } from "@/types/db";
 import TransactionsTableClient from "./TransactionsTableClient";
+import TransactionsFiltersClient from "./TransactionsFiltersClient";
 
 type TxRow = {
   id: string;
   user_id: string;
   account_id: string;
-  date: string; // YYYY-MM-DD (fecha del movimiento)
+  date: string;
   description_raw: string;
   merchant_name: string | null;
   category_id: string | null;
@@ -17,7 +17,6 @@ type TxRow = {
   type: TransactionType;
   import_batch_id: string | null;
   created_at: string;
-
   receipt?: string | null;
   installment_number?: number | null;
   installments_total?: number | null;
@@ -27,14 +26,14 @@ type ImportBatchRow = {
   id: string;
   user_id: string;
   account_id: string;
-  created_at: string; // timestamptz
+  created_at: string;
   provider: string | null;
   institution: string | null;
   file_name: string | null;
-  due_date: string | null; // date
-  cut_off_date: string | null; // date
-  statement_period_start: string | null; // date
-  statement_period_end: string | null; // date
+  due_date: string | null;
+  cut_off_date: string | null;
+  statement_period_start: string | null;
+  statement_period_end: string | null;
   note: string | null;
 };
 
@@ -45,7 +44,6 @@ function getParam(sp: SearchParams, key: string): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }
 
-// Fecha local ISO (tz) sin librerías externas
 function getLocalISODate(tz = "America/Argentina/Cordoba", d = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
@@ -63,11 +61,10 @@ function startOfMonthISO(isoDate: string) {
   return `${isoDate.slice(0, 7)}-01`;
 }
 
-// Fin de mes en TZ (evita off-by-one por UTC)
 function endOfMonthISO(isoDate: string, tz: string) {
   const y = Number(isoDate.slice(0, 4));
-  const m0 = Number(isoDate.slice(5, 7)) - 1; // 0-11
-  const d = new Date(Date.UTC(y, m0 + 1, 0, 12, 0, 0)); // último día del mes (a mediodía UTC)
+  const m0 = Number(isoDate.slice(5, 7)) - 1;
+  const d = new Date(Date.UTC(y, m0 + 1, 0, 12, 0, 0));
   return getLocalISODate(tz, d);
 }
 
@@ -109,12 +106,9 @@ function batchLabel(b: ImportBatchRow) {
   return `${provider} · ${ref}${note}${file}`;
 }
 
-export default async function TransactionsPage(props: {
-  searchParams: Promise<SearchParams>;
-}) {
+export default async function TransactionsPage(props: { searchParams: Promise<SearchParams> }) {
   const supabase = await createClient();
 
-  // claims + user (tu flujo actual)
   const { data, error } = await supabase.auth.getClaims();
   if (error || !data?.claims) redirect("/auth/login");
 
@@ -125,26 +119,35 @@ export default async function TransactionsPage(props: {
 
   const sp = await props.searchParams;
 
+  const tz = "America/Argentina/Cordoba";
+  const today = getLocalISODate(tz);
+  const defaultFrom = startOfMonthISO(today);
+  const defaultTo = endOfMonthISO(today, tz);
+  const defaultBudgetMonth = today.slice(0, 7); // YYYY-MM
+
+  const from = (getParam(sp, "from") ?? defaultFrom).trim();
+  const to = (getParam(sp, "to") ?? defaultTo).trim();
+
   const accountId = (getParam(sp, "account") ?? "").trim();
+  const batchId = (getParam(sp, "batch") ?? "").trim();
+  const useDate = getParam(sp, "useDate") === "1";
+
+  // ✅ nuevo
+  const budget = getParam(sp, "budget") === "1";
+  const budgetMonth = (getParam(sp, "budgetMonth") ?? defaultBudgetMonth).trim(); // YYYY-MM
+  const budgetStart = `${budgetMonth}-01`;
+  const budgetEnd = endOfMonthISO(budgetStart, tz);
+
   const type = ((getParam(sp, "type") ?? "").trim() as TransactionType | "") || "";
   const categoryId = (getParam(sp, "category") ?? "").trim();
   const q = (getParam(sp, "q") ?? "").trim();
   const uncategorized = getParam(sp, "uncategorized") === "1";
 
-  // Batch (opcional)
-  const batchId = (getParam(sp, "batch") ?? "").trim();
-
-  // Paginación
   const per = Math.min(Math.max(Number(getParam(sp, "per") ?? "50") || 50, 10), 200);
   const page = Math.max(Number(getParam(sp, "page") ?? "1") || 1, 1);
 
   const fromIdx = (page - 1) * per;
   const toIdx = fromIdx + per - 1;
-
-  const tz = "America/Argentina/Cordoba";
-  const today = getLocalISODate(tz);
-  const defaultFrom = startOfMonthISO(today);
-  const defaultTo = endOfMonthISO(today, tz);
 
   const [
     { data: accountsData },
@@ -170,57 +173,63 @@ export default async function TransactionsPage(props: {
       )
       .eq("user_id", user.id)
       .order("created_at", { ascending: false })
-      .limit(50),
+      .limit(60),
   ]);
 
   const accounts = (accountsData ?? []) as Account[];
   const categories = (categoriesData ?? []) as Category[];
-
   const allBatches = (batchesData ?? []) as ImportBatchRow[];
-  const selectedBatch = batchId ? allBatches.find((b) => b.id === batchId) ?? null : null;
+  if (batchesErr) console.error("Error cargando import_batches:", batchesErr);
 
-  // Dropdown batches filtrado por cuenta, pero manteniendo el seleccionado visible
-  let batches = accountId ? allBatches.filter((b) => b.account_id === accountId) : allBatches;
-  if (selectedBatch && !batches.some((b) => b.id === selectedBatch.id)) {
-    batches = [selectedBatch, ...batches];
-  }
+  // ✅ en modo presupuesto mensual, necesitamos los batch ids cuyo due_date cae en el mes
+  let budgetBatchIds: string[] = [];
+  if (budget) {
+    let qb = supabase
+      .from("import_batches")
+      .select("id")
+      .eq("user_id", user.id)
+      .gte("due_date", budgetStart)
+      .lte("due_date", budgetEnd)
+      .limit(500);
 
-  if (batchesErr) {
-    console.error("Error cargando import_batches:", batchesErr);
+    if (accountId) qb = qb.eq("account_id", accountId);
+
+    const { data: idRows, error: idErr } = await qb;
+    if (idErr) console.error("Error buscando batches para presupuesto mensual:", idErr);
+    budgetBatchIds = (idRows ?? []).map((r: any) => String(r.id));
   }
 
   /**
-   * FILTRO PRINCIPAL (NUEVO):
-   * Usamos budget_month (primer día de mes) para alinear:
-   * - Resúmenes TC: mes del due_date del batch
-   * - Transacciones manuales: mes de due_date si existe (o del date si no existe)
-   *
-   * UI sigue siendo “Desde / Hasta” con input date, pero el filtro se aplica por mes.
+   * ✅ FILTRO
+   * - Si budget=1: (TC por due_date del batch) OR (manuales por date dentro del mes)
+   * - Si budget=0: se mantienen las 4 reglas anteriores (Fecha/Resumen)
    */
-  const fromParam = (getParam(sp, "from") ?? "").trim();
-  const toParam = (getParam(sp, "to") ?? "").trim();
-
-  // Si hay batch y tiene due_date, sugerimos ese mes en la UI (sin forzar)
-  const batchDue = selectedBatch?.due_date ?? "";
-  const suggestedFromUi = batchDue ? startOfMonthISO(batchDue) : "";
-  const suggestedToUi = batchDue ? endOfMonthISO(batchDue, tz) : "";
-
-  const fromUi = fromParam || suggestedFromUi || defaultFrom;
-  const toUi = toParam || suggestedToUi || defaultTo;
-
-  // Valores efectivos del filtro por mes (budget_month siempre es YYYY-MM-01)
-  const fromBudget = startOfMonthISO(fromUi);
-  const toBudget = startOfMonthISO(toUi);
-
-  // Helper: aplica filtros comunes a una query
-  const applyCommonFilters = (q0: any) => {
+  const applyFilters = (q0: any) => {
     let qx = q0.eq("user_id", user.id);
 
-    // Filtro por mes imputado (budget_month)
-    qx = qx.gte("budget_month", fromBudget).lte("budget_month", toBudget);
-
-    // Batch (opcional)
-    if (batchId) qx = qx.eq("import_batch_id", batchId);
+    if (budget) {
+      // OR:
+      // 1) import_batch_id in (batches del mes)  -> tarjeta
+      // 2) import_batch_id is null AND date in [budgetStart, budgetEnd] -> manuales del mes
+      if (budgetBatchIds.length > 0) {
+        const inList = budgetBatchIds.join(",");
+        qx = qx.or(
+          `import_batch_id.in.(${inList}),and(import_batch_id.is.null,date.gte.${budgetStart},date.lte.${budgetEnd})`
+        );
+      } else {
+        qx = qx.is("import_batch_id", null).gte("date", budgetStart).lte("date", budgetEnd);
+      }
+      // En presupuesto mensual, ignoramos batchId y useDate deliberadamente.
+    } else {
+      // Reglas originales:
+      if (!useDate) {
+        if (batchId) qx = qx.eq("import_batch_id", batchId);
+      } else {
+        qx = qx.gte("date", from).lte("date", to);
+        if (batchId) qx = qx.eq("import_batch_id", batchId);
+        else qx = qx.is("import_batch_id", null);
+      }
+    }
 
     if (accountId) qx = qx.eq("account_id", accountId);
     if (type) qx = qx.eq("type", type);
@@ -236,7 +245,7 @@ export default async function TransactionsPage(props: {
     return qx;
   };
 
-  // Query transacciones paginadas (listado)
+  // Listado
   let txQ = supabase
     .from("transactions")
     .select(
@@ -244,7 +253,7 @@ export default async function TransactionsPage(props: {
       { count: "exact" }
     );
 
-  txQ = applyCommonFilters(txQ);
+  txQ = applyFilters(txQ);
 
   const { data: txData, error: txErr, count } = await txQ
     .order("date", { ascending: false })
@@ -257,12 +266,8 @@ export default async function TransactionsPage(props: {
   const totalCount = count ?? 0;
   const totalPages = Math.max(Math.ceil(totalCount / per), 1);
 
-  /**
-   * TOTALES (alineados a budget_month)
-   * Para no depender de RPCs (que todavía filtran por `date`), calculamos en server-side
-   * paginando en chunks para que el total sea correcto.
-   */
-  const totalsAcc = {
+  // Totales (chunk)
+  const totals = {
     total: 0,
     expense: 0,
     income: 0,
@@ -281,11 +286,8 @@ export default async function TransactionsPage(props: {
       const off = i * CHUNK;
       const hi = off + CHUNK - 1;
 
-      let tq = supabase
-        .from("transactions")
-        .select("amount,type", { count: "exact" });
-
-      tq = applyCommonFilters(tq);
+      let tq = supabase.from("transactions").select("amount,type");
+      tq = applyFilters(tq);
 
       const { data: part, error: partErr } = await tq.range(off, hi);
       if (partErr) {
@@ -297,24 +299,20 @@ export default async function TransactionsPage(props: {
         const amount = Number((r as any).amount ?? 0);
         const t = String((r as any).type ?? "other") as TransactionType | "other";
 
-        totalsAcc.total += amount;
-        if (t === "expense") totalsAcc.expense += amount;
-        else if (t === "income") totalsAcc.income += amount;
-        else if (t === "payment") totalsAcc.payment += amount;
-        else if (t === "transfer") totalsAcc.transfer += amount;
-        else if (t === "fee") totalsAcc.fee += amount;
-        else totalsAcc.other += amount;
+        totals.total += amount;
+        if (t === "expense") totals.expense += amount;
+        else if (t === "income") totals.income += amount;
+        else if (t === "payment") totals.payment += amount;
+        else if (t === "transfer") totals.transfer += amount;
+        else if (t === "fee") totals.fee += amount;
+        else totals.other += amount;
       }
     }
   }
 
-  // Conteo “sin categoría” (misma base)
-  let uncQ = supabase
-    .from("transactions")
-    .select("id", { count: "exact", head: true });
-
-  uncQ = applyCommonFilters(uncQ).is("category_id", null);
-
+  // Conteo sin categoría
+  let uncQ = supabase.from("transactions").select("id", { count: "exact", head: true });
+  uncQ = applyFilters(uncQ).is("category_id", null);
   const { count: uncategorizedCount, error: uncErr } = await uncQ;
   if (uncErr) console.error("uncategorized count error:", uncErr);
 
@@ -322,63 +320,23 @@ export default async function TransactionsPage(props: {
 
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 space-y-4">
-      {/* Header */}
       <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-xl font-semibold text-slate-100">Transacciones</h1>
-          <div className="text-sm text-slate-300">
-            Mostrando {rows.length} de {totalCount} (página {page} de {totalPages})
-          </div>
-
-          <div className="mt-2 text-xs text-slate-300">
-            <span className="rounded-md border border-slate-700 bg-slate-950/40 px-2 py-1 inline-flex items-center">
-              Mes imputado (budget_month):{" "}
-              <span className="ml-2 text-slate-100 font-medium">
-                {fromBudget} → {toBudget}
-              </span>
-            </span>
-          </div>
-
-          {selectedBatch ? (
-            <div className="mt-2 text-xs text-slate-300">
-              <span className="rounded-md border border-slate-700 bg-slate-950/40 px-2 py-1 inline-flex items-center">
-                Resumen seleccionado:{" "}
-                <span className="ml-2 text-slate-100 font-medium">{batchLabel(selectedBatch)}</span>
-              </span>
-            </div>
-          ) : null}
+        <div className="text-sm text-slate-300">
+          Mostrando {rows.length} de {totalCount} (página {page} de {totalPages})
         </div>
 
-        <div className="flex flex-wrap gap-2 md:justify-end">
-          <Link
-            href="/protected/reports"
-            className="inline-flex items-center justify-center rounded-md border border-slate-700 px-4 py-1.5 text-sm text-slate-200 hover:bg-slate-800"
-          >
-            Ir a Visualizaciones
-          </Link>
-          <Link
-            href="/protected/transactions/import-pdf"
-            className="inline-flex items-center justify-center rounded-md bg-emerald-500 px-4 py-1.5 text-sm font-medium text-slate-950 hover:bg-emerald-400"
-          >
-            Importar PDF
-          </Link>
+        <div className="text-right text-sm text-slate-300">
+          <div>
+            Total filtro:{" "}
+            <span className="text-slate-100 font-medium">{formatMoneyARS(totals.total)}</span>
+          </div>
+          <div className="text-xs text-slate-400">
+            Gastos: {formatMoneyARS(totals.expense)} · Ingresos: {formatMoneyARS(totals.income)} · Pagos:{" "}
+            {formatMoneyARS(totals.payment)}
+          </div>
         </div>
       </div>
 
-      {/* Totales */}
-      <div className="text-right text-sm text-slate-300">
-        <div>
-          Total filtro:{" "}
-          <span className="text-slate-100 font-medium">{formatMoneyARS(Number(totalsAcc.total ?? 0))}</span>
-        </div>
-        <div className="text-xs text-slate-400">
-          Gastos: {formatMoneyARS(Number(totalsAcc.expense ?? 0))} · Ingresos:{" "}
-          {formatMoneyARS(Number(totalsAcc.income ?? 0))} · Pagos:{" "}
-          {formatMoneyARS(Number(totalsAcc.payment ?? 0))}
-        </div>
-      </div>
-
-      {/* Atajo “Sin categoría” */}
       <div className="flex items-center gap-2">
         <Link
           href={basePath + buildQueryString(sp, { uncategorized: "1", category: "", page: "1" })}
@@ -389,172 +347,37 @@ export default async function TransactionsPage(props: {
             {uncategorizedCount ?? 0}
           </span>
         </Link>
-
-        {uncategorized && (
-          <Link
-            href={basePath + buildQueryString(sp, { uncategorized: "", page: "1" })}
-            className="text-sm text-slate-300 hover:text-slate-100"
-          >
-            Quitar filtro
-          </Link>
-        )}
       </div>
 
-      {/* Filtros */}
-      <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
-        <div className="md:col-span-2">
-          <label className="text-xs text-slate-300">Desde</label>
-          <input
-            type="date"
-            name="from"
-            defaultValue={fromUi}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          />
-          <div className="mt-1 text-[11px] text-slate-400">Filtra por mes imputado (budget_month).</div>
-        </div>
+      <TransactionsFiltersClient
+        basePath={basePath}
+        accounts={accounts}
+        categories={categories}
+        batches={allBatches.map((b) => ({
+          id: b.id,
+          account_id: b.account_id,
+          label: batchLabel(b),
+          due_date: b.due_date,
+          cut_off_date: b.cut_off_date,
+        }))}
+        initial={{
+          from,
+          to,
+          accountId,
+          batchId,
+          type,
+          categoryId,
+          q,
+          uncategorized,
+          per,
+          useDate,
+          budget,
+          budgetMonth,
+        }}
+      />
 
-        <div className="md:col-span-2">
-          <label className="text-xs text-slate-300">Hasta</label>
-          <input
-            type="date"
-            name="to"
-            defaultValue={toUi}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          />
-        </div>
-
-        <div className="md:col-span-3">
-          <label className="text-xs text-slate-300">Cuenta</label>
-          <select
-            name="account"
-            defaultValue={accountId}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            <option value="">Todas</option>
-            {accounts.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name} ({a.currency})
-              </option>
-            ))}
-          </select>
-        </div>
-
-        {/* Selector de resumen PDF */}
-        <div className="md:col-span-5">
-          <label className="text-xs text-slate-300">Resumen (PDF importado)</label>
-          <select
-            name="batch"
-            defaultValue={batchId}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            <option value="">Todos</option>
-            {batches.map((b) => (
-              <option key={b.id} value={b.id}>
-                {batchLabel(b)}
-              </option>
-            ))}
-          </select>
-          <div className="mt-1 text-[11px] text-slate-400">
-            El mes imputado de un resumen se calcula por su <span className="text-slate-200">vencimiento</span>.
-          </div>
-        </div>
-
-        <div className="md:col-span-2">
-          <label className="text-xs text-slate-300">Tipo</label>
-          <select
-            name="type"
-            defaultValue={type}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            <option value="">Todos</option>
-            <option value="expense">Gasto</option>
-            <option value="income">Ingreso</option>
-            <option value="payment">Pago</option>
-            <option value="transfer">Transferencia</option>
-            <option value="fee">Comisión</option>
-            <option value="other">Otro</option>
-          </select>
-        </div>
-
-        <div className="md:col-span-3">
-          <label className="text-xs text-slate-300">Categoría</label>
-          <select
-            name="category"
-            defaultValue={categoryId}
-            disabled={uncategorized}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-60"
-          >
-            <option value="">Todas</option>
-            {categories.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-                {c.subcategory ? ` / ${c.subcategory}` : ""}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="md:col-span-3">
-          <label className="text-xs text-slate-300">Buscar</label>
-          <input
-            type="text"
-            name="q"
-            defaultValue={q}
-            placeholder="Ej: mercadopago, shell..."
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          />
-        </div>
-
-        <div className="md:col-span-2 flex items-center gap-2">
-          <input
-            id="uncategorized"
-            type="checkbox"
-            name="uncategorized"
-            value="1"
-            defaultChecked={uncategorized}
-            className="h-4 w-4 accent-emerald-500"
-          />
-          <label htmlFor="uncategorized" className="text-sm text-slate-200">
-            Sin categoría
-          </label>
-        </div>
-
-        <div className="md:col-span-2">
-          <label className="text-xs text-slate-300">Por página</label>
-          <select
-            name="per"
-            defaultValue={String(per)}
-            className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            <option value="25">25</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-            <option value="200">200</option>
-          </select>
-        </div>
-
-        <input type="hidden" name="page" value="1" />
-
-        <div className="md:col-span-2 flex gap-2 justify-end">
-          <button
-            type="submit"
-            className="inline-flex items-center justify-center rounded-md bg-emerald-500 px-4 py-1.5 text-sm font-medium text-slate-950 hover:bg-emerald-400"
-          >
-            Aplicar
-          </button>
-          <Link
-            href={basePath}
-            className="inline-flex items-center justify-center rounded-md border border-slate-700 px-4 py-1.5 text-sm text-slate-200 hover:bg-slate-800"
-          >
-            Limpiar
-          </Link>
-        </div>
-      </form>
-
-      {/* Tabla con quick edits */}
       <TransactionsTableClient rows={rows} accounts={accounts} categories={categories} />
 
-      {/* Paginación */}
       <div className="flex items-center justify-between">
         <div className="text-xs text-slate-400">
           Página {page} de {totalPages}

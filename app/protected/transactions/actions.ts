@@ -124,9 +124,7 @@ function resolveBudgetMonthForBatch(input: {
   return monthStartISO(base);
 }
 
-/**
- * IMPORT PDF
- */
+
 export async function importTransactionsFromPdf(formData: FormData) {
   const supabase = await createClient();
 
@@ -137,27 +135,34 @@ export async function importTransactionsFromPdf(formData: FormData) {
 
   if (userError) {
     console.error(userError);
-    throw new Error('No se pudo validar la sesión.');
+    throw new Error("No se pudo validar la sesión.");
   }
-  if (!user) redirect('/auth/login');
+  if (!user) redirect("/auth/login");
 
-  const accountId = String(formData.get('account_id') ?? '').trim();
-  const fallbackType = String(formData.get('type') ?? 'expense').trim() as TransactionType;
+  const accountId = String(formData.get("account_id") ?? "").trim();
+  const fallbackType = String(formData.get("type") ?? "expense").trim() as TransactionType;
 
-  const file = formData.get('file');
-  if (!accountId) throw new Error('Falta account_id.');
-  if (!(file instanceof File)) throw new Error('Falta el archivo PDF.');
-  if (file.type && file.type !== 'application/pdf') throw new Error('El archivo no es un PDF.');
+  const file = formData.get("file");
+  if (!accountId) throw new Error("Falta account_id.");
+  if (!(file instanceof File)) throw new Error("Falta el archivo PDF.");
+  if (file.type && file.type !== "application/pdf") throw new Error("El archivo no es un PDF.");
 
   // Metadata opcional del statement
-  const provider = cleanTextOrNull(formData.get('provider')) ?? 'VISA';
-  const institution = cleanTextOrNull(formData.get('institution')) ?? null;
-  const note = cleanTextOrNull(formData.get('note')) ?? null;
+  const provider = cleanTextOrNull(formData.get("provider")) ?? "VISA";
+  const institution = cleanTextOrNull(formData.get("institution")) ?? null;
+  const note = cleanTextOrNull(formData.get("note")) ?? null;
 
-  const dueDate = isoDateOrNull(formData.get('due_date'), 'due_date');
-  const cutOffDate = isoDateOrNull(formData.get('cut_off_date'), 'cut_off_date');
-  const periodStart = isoDateOrNull(formData.get('statement_period_start'), 'statement_period_start');
-  const periodEnd = isoDateOrNull(formData.get('statement_period_end'), 'statement_period_end');
+  // ✅ Regla de negocio: para PDF, due_date debe existir para que budget_month sea “mes presupuestario”
+  const dueDate = isoDateOrNull(formData.get("due_date"), "due_date");
+  if (!dueDate) {
+    throw new Error(
+      "Falta due_date (vencimiento del resumen). Es necesario para asignar el mes presupuestario (budget_month) por vencimiento."
+    );
+  }
+
+  const cutOffDate = isoDateOrNull(formData.get("cut_off_date"), "cut_off_date");
+  const periodStart = isoDateOrNull(formData.get("statement_period_start"), "statement_period_start");
+  const periodEnd = isoDateOrNull(formData.get("statement_period_end"), "statement_period_end");
 
   const ab = await file.arrayBuffer();
   const buffer = Buffer.from(ab);
@@ -166,29 +171,29 @@ export async function importTransactionsFromPdf(formData: FormData) {
   const rows = await parseStatementPdf(buffer);
 
   if (!rows.length) {
-    redirect('/protected/transactions/import-pdf?imported=0');
+    redirect("/protected/transactions/import-pdf?imported=0");
   }
 
   // Cargar reglas una sola vez
   const { data: rulesData, error: rulesErr } = await supabase
-    .from('merchant_rules')
-    .select('id, user_id, pattern, match_type, merchant_name, category_id, priority, created_at')
-    .eq('user_id', user.id)
-    .order('priority', { ascending: false });
+    .from("merchant_rules")
+    .select("id, user_id, pattern, match_type, merchant_name, category_id, priority, created_at")
+    .eq("user_id", user.id)
+    .order("priority", { ascending: false });
 
   if (rulesErr) {
-    console.error('Error cargando merchant_rules:', rulesErr);
+    console.error("Error cargando merchant_rules:", rulesErr);
   }
 
   const rules = (rulesData ?? []) as MerchantRule[];
 
   // 1) Crear batch en DB (fuente de verdad para import_batch_id)
   const { data: batch, error: batchErr } = await supabase
-    .from('import_batches')
+    .from("import_batches")
     .insert({
       user_id: user.id,
       account_id: accountId,
-      source: 'pdf',
+      source: "pdf",
       provider,
       institution,
       file_name: file.name,
@@ -199,36 +204,30 @@ export async function importTransactionsFromPdf(formData: FormData) {
       statement_period_end: periodEnd,
       note,
     })
-    .select('id')
+    .select("id")
     .single();
 
   if (batchErr) {
     const code = (batchErr as any)?.code;
-    if (code === '23505') {
-      console.warn('PDF duplicado detectado (sha256). Abortando import:', file.name);
-      redirect('/protected/transactions/import-pdf?imported=0&duplicate=1');
+    if (code === "23505") {
+      console.warn("PDF duplicado detectado (sha256). Abortando import:", file.name);
+      redirect("/protected/transactions/import-pdf?imported=0&duplicate=1");
     }
 
-    console.error('Error creando import_batch:', batchErr);
-    throw new Error('Error creando el batch de importación.');
+    console.error("Error creando import_batch:", batchErr);
+    throw new Error("Error creando el batch de importación.");
   }
 
   const importBatchId = batch.id;
 
-  // ✅ budget_month por vencimiento del resumen (due_date), con fallback
-  const budgetMonthForBatch = resolveBudgetMonthForBatch({
-    dueDate,
-    statementPeriodEnd: periodEnd,
-    cutOffDate,
-    firstTxDateFallback: rows[0].date, // parser: YYYY-MM-DD
-  });
-
   // 2) Armar inserts con import_batch_id real
+  // ✅ NO enviar budget_month: es GENERATED ALWAYS en la DB.
+  // ✅ Enviar due_date para que budget_month se derive por vencimiento.
   const inserts = rows.map((r) => {
     const type = normalizeType(r.description, fallbackType);
 
     const { merchant_name, category_id } =
-      type === 'payment'
+      type === "payment"
         ? { merchant_name: null, category_id: null, matched_rule_id: null }
         : applyMerchantRules(r.description, rules);
 
@@ -238,13 +237,13 @@ export async function importTransactionsFromPdf(formData: FormData) {
       user_id: user.id,
       account_id: accountId,
 
-      date: r.date, // YYYY-MM-DD (fecha del consumo/movimiento)
-      // ✅ budget_month: mes de presupuesto (para TC: vence el resumen)
-      budget_month: budgetMonthForBatch,
-      due_date: dueDate, // ✅ clave para budget_month por vencimiento
+      date: r.date,        // fecha del consumo/movimiento
+      due_date: dueDate,   // ✅ clave para budget_month (vencimiento del resumen)
+
       description_raw: r.description,
-      merchant_name: type === 'payment' ? null : finalMerchantName,
-      category_id: type === 'payment' ? null : category_id,
+      merchant_name: type === "payment" ? null : finalMerchantName,
+      category_id: type === "payment" ? null : category_id,
+
       amount: signedAmount(r.amount), // siempre positivo
       type,
       import_batch_id: importBatchId,
@@ -256,26 +255,33 @@ export async function importTransactionsFromPdf(formData: FormData) {
   });
 
   const { error: insErr, data: inserted } = await supabase
-    .from('transactions')
+    .from("transactions")
     .insert(inserts)
-    .select('id');
+    .select("id");
 
   if (insErr) {
-    console.error('Supabase insert error:', insErr);
+    console.error("Supabase insert error:", insErr);
 
     // Cleanup best-effort
     try {
-      await supabase.from('import_batches').delete().eq('id', importBatchId).eq('user_id', user.id);
+      await supabase.from("import_batches").delete().eq("id", importBatchId).eq("user_id", user.id);
     } catch (e) {
-      console.warn('No se pudo limpiar import_batches tras fallo de insert:', e);
+      console.warn("No se pudo limpiar import_batches tras fallo de insert:", e);
     }
 
-    throw new Error('Error insertando transacciones en la base.');
+    const parts = [
+      insErr.message,
+      (insErr as any).details,
+      (insErr as any).hint,
+      (insErr as any).code ? `code=${(insErr as any).code}` : null,
+    ].filter(Boolean);
+
+    throw new Error(`Error insertando transacciones en la base: ${parts.join(" | ")}`);
   }
 
-  revalidatePath('/protected/transactions');
-  revalidatePath('/protected/transactions/import-pdf');
-  revalidatePath('/protected/reports');
+  revalidatePath("/protected/transactions");
+  revalidatePath("/protected/transactions/import-pdf");
+  revalidatePath("/protected/reports");
 
   const importedCount = inserted?.length ?? inserts.length;
   redirect(`/protected/transactions/import-pdf?imported=${importedCount}`);
@@ -374,6 +380,98 @@ export async function updateTransactionInline(input: {
   revalidatePath('/protected/reports');
 }
 
+// export async function createTransaction(formData: FormData) {
+//   const supabase = await createClient();
+
+//   const {
+//     data: { user },
+//     error: userError,
+//   } = await supabase.auth.getUser();
+
+//   if (userError) {
+//     console.error(userError);
+//     throw new Error("No se pudo validar la sesión.");
+//   }
+//   if (!user) redirect("/auth/login");
+
+//   const accountId = String(formData.get("account_id") ?? "").trim();
+//   const date = isoDateOrNull(formData.get("date"), "date");
+//   const dueDate = isoDateOrNull(formData.get("due_date"), "due_date"); // opcional
+//   const descriptionRaw = String(formData.get("description_raw") ?? "").trim();
+//   const amountRaw = String(formData.get("amount") ?? "").trim();
+//   const type = String(formData.get("type") ?? "expense").trim() as TransactionType;
+
+//   const merchantNameInput = cleanTextOrNull(formData.get("merchant_name"));
+//   const categoryIdInput = cleanTextOrNull(formData.get("category_id"));
+//   const saveRule = String(formData.get("save_rule") ?? "") === "1";
+
+//   if (!accountId) throw new Error("Falta account_id.");
+//   if (!date) throw new Error("Falta date.");
+//   if (!descriptionRaw) throw new Error("Falta description_raw.");
+//   if (!amountRaw) throw new Error("Falta amount.");
+
+//   const amountNum = Number(amountRaw);
+//   if (!Number.isFinite(amountNum) || amountNum === 0) {
+//     throw new Error("Monto inválido (debe ser numérico y distinto de 0).");
+//   }
+
+//   const isPayment = type === "payment";
+//   const finalMerchantName = isPayment ? null : (merchantNameInput ?? descriptionRaw);
+//   const finalCategoryId = isPayment ? null : categoryIdInput;
+
+//   const { error: insErr } = await supabase.from("transactions").insert({
+//     user_id: user.id,
+//     account_id: accountId,
+//     date,
+//     due_date: dueDate, // si no viene, queda NULL
+//     description_raw: descriptionRaw,
+//     merchant_name: finalMerchantName,
+//     category_id: finalCategoryId,
+//     amount: signedAmount(amountNum),
+//     type,
+//     import_batch_id: null,
+//   });
+
+//   if (insErr) {
+//     console.error("createTransaction insert error:", insErr);
+
+//     // Esto te va a decir EXACTAMENTE por qué falla (RLS, columna inexistente, etc.)
+//     const parts = [
+//       insErr.message,
+//       (insErr as any).details,
+//       (insErr as any).hint,
+//       (insErr as any).code ? `code=${(insErr as any).code}` : null,
+//     ].filter(Boolean);
+
+//     throw new Error(`Error insertando la transacción: ${parts.join(" | ")}`);
+//   }
+
+//   if (saveRule && !isPayment && finalMerchantName && finalCategoryId) {
+//     const { error: ruleErr } = await supabase
+//       .from("merchant_rules")
+//       .upsert(
+//         {
+//           user_id: user.id,
+//           pattern: finalMerchantName,
+//           match_type: "equals",
+//           merchant_name: finalMerchantName,
+//           category_id: finalCategoryId,
+//           priority: 1000,
+//         },
+//         { onConflict: "user_id,match_type,pattern" }
+//       );
+
+//     // No abortamos: la transacción ya quedó guardada
+//     if (ruleErr) console.error("createTransaction merchant_rules upsert error:", ruleErr);
+//   }
+
+//   revalidatePath("/protected/transactions");
+//   revalidatePath("/protected/reports");
+//   revalidatePath("/protected/transactions/new");
+
+//   redirect("/protected/transactions/new?saved=1");
+// }
+
 export async function createTransaction(formData: FormData) {
   const supabase = await createClient();
 
@@ -389,14 +487,22 @@ export async function createTransaction(formData: FormData) {
   if (!user) redirect("/auth/login");
 
   const accountId = String(formData.get("account_id") ?? "").trim();
+
+  // Fecha operación (requerida)
   const date = isoDateOrNull(formData.get("date"), "date");
-  const dueDate = isoDateOrNull(formData.get("due_date"), "due_date"); // opcional
+
+  // Vencimiento (opcional) — blindado contra ''
+  const dueDateRaw = String(formData.get("due_date") ?? "").trim();
+  const dueDate = dueDateRaw ? isoDateOrNull(dueDateRaw, "due_date") : null;
+
   const descriptionRaw = String(formData.get("description_raw") ?? "").trim();
   const amountRaw = String(formData.get("amount") ?? "").trim();
   const type = String(formData.get("type") ?? "expense").trim() as TransactionType;
 
+  // Blindar contra '' (uuid vacío) y textos vacíos
   const merchantNameInput = cleanTextOrNull(formData.get("merchant_name"));
   const categoryIdInput = cleanTextOrNull(formData.get("category_id"));
+
   const saveRule = String(formData.get("save_rule") ?? "") === "1";
 
   if (!accountId) throw new Error("Falta account_id.");
@@ -410,6 +516,8 @@ export async function createTransaction(formData: FormData) {
   }
 
   const isPayment = type === "payment";
+
+  // Si es payment, no clasificamos
   const finalMerchantName = isPayment ? null : (merchantNameInput ?? descriptionRaw);
   const finalCategoryId = isPayment ? null : categoryIdInput;
 
@@ -417,19 +525,19 @@ export async function createTransaction(formData: FormData) {
     user_id: user.id,
     account_id: accountId,
     date,
-    due_date: dueDate, // si no viene, queda NULL
+    due_date: dueDate, // ✅ opcional (NULL si no viene)
     description_raw: descriptionRaw,
     merchant_name: finalMerchantName,
     category_id: finalCategoryId,
-    amount: signedAmount(amountNum),
+    amount: signedAmount(amountNum), // siempre positivo
     type,
     import_batch_id: null,
+    // budget_month: NO (GENERATED)
   });
 
   if (insErr) {
     console.error("createTransaction insert error:", insErr);
 
-    // Esto te va a decir EXACTAMENTE por qué falla (RLS, columna inexistente, etc.)
     const parts = [
       insErr.message,
       (insErr as any).details,
@@ -440,6 +548,7 @@ export async function createTransaction(formData: FormData) {
     throw new Error(`Error insertando la transacción: ${parts.join(" | ")}`);
   }
 
+  // Guardado de regla (si lo usás desde UI)
   if (saveRule && !isPayment && finalMerchantName && finalCategoryId) {
     const { error: ruleErr } = await supabase
       .from("merchant_rules")
@@ -465,3 +574,4 @@ export async function createTransaction(formData: FormData) {
 
   redirect("/protected/transactions/new?saved=1");
 }
+
