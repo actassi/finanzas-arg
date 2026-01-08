@@ -101,7 +101,10 @@ function detectColumnBounds(items: Item[]) {
   };
 }
 
-let pdfjsPromise: Promise<any> | null = null;
+type PdfJsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
+type TextItem = { str: string; transform: number[] };
+
+let pdfjsPromise: Promise<PdfJsModule> | null = null;
 
 async function getPdfJs() {
   if (!pdfjsPromise) {
@@ -140,7 +143,7 @@ export async function parseVisaPdf(buffer: Buffer): Promise<Tx[]> {
     const page = await pdf.getPage(p);
     const tc = await page.getTextContent();
 
-    const items: Item[] = (tc.items as any[])
+    const items: Item[] = (tc.items as TextItem[])
       .map((it) => {
         const t = it.transform; // [a,b,c,d,e,f] => e=x, f=y
         return { str: String(it.str).trim(), x: t[4], y: t[5] };
