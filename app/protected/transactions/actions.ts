@@ -5,6 +5,7 @@ import { createClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import { parseStatementPdf } from '@/lib/pdf/statementParser';
+import { parseMacroVisaStatementPdf } from '@/lib/pdf/macroVisaStatementParser';
 import type { MerchantRule, MatchType, TransactionType } from '@/types/db';
 import crypto from 'node:crypto';
 
@@ -164,11 +165,40 @@ export async function importTransactionsFromPdf(formData: FormData) {
   const periodStart = isoDateOrNull(formData.get("statement_period_start"), "statement_period_start");
   const periodEnd = isoDateOrNull(formData.get("statement_period_end"), "statement_period_end");
 
+  const parserType = String(formData.get("parser_type") ?? "standard").trim();
+
   const ab = await file.arrayBuffer();
   const buffer = Buffer.from(ab);
   const fileHash = sha256Hex(buffer);
 
-  const rows = await parseStatementPdf(buffer);
+  type ParsedRow = {
+    date: string;
+    description: string;
+    amount: number;
+    receipt: string | null;
+    installmentNumber: number | null;
+    installmentsTotal: number | null;
+    type?: TransactionType | null;
+  };
+
+  let rows: ParsedRow[] = [];
+
+  if (parserType === "macro_visa_ocr") {
+    const parsed = await parseMacroVisaStatementPdf(buffer);
+    rows = parsed.transactions
+      .map((tx) => ({
+        date: tx.date,
+        description: tx.description,
+        amount: tx.amount_ars,
+        receipt: tx.receipt ?? null,
+        installmentNumber: tx.installment_number ?? null,
+        installmentsTotal: tx.installments_total ?? null,
+        type: tx.type ?? null,
+      }))
+      .filter((tx) => Number.isFinite(tx.amount) && tx.amount !== 0);
+  } else {
+    rows = await parseStatementPdf(buffer);
+  }
 
   if (!rows.length) {
     redirect("/protected/transactions/import-pdf?imported=0");
@@ -224,7 +254,8 @@ export async function importTransactionsFromPdf(formData: FormData) {
   // ✅ NO enviar budget_month: es GENERATED ALWAYS en la DB.
   // ✅ Enviar due_date para que budget_month se derive por vencimiento.
   const inserts = rows.map((r) => {
-    const type = normalizeType(r.description, fallbackType);
+    const resolvedType = r.type ?? fallbackType;
+    const type = normalizeType(r.description, resolvedType);
 
     const { merchant_name, category_id } =
       type === "payment"
@@ -574,4 +605,3 @@ export async function createTransaction(formData: FormData) {
 
   redirect("/protected/transactions/new?saved=1");
 }
-

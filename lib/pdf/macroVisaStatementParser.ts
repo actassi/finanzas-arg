@@ -9,11 +9,6 @@ import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
 import sharp from "sharp";
 
-async function renderPageToPng(/* ... */) {
-  const { createCanvas } = await import('@napi-rs/canvas');
-  // ... resto igual
-}
-
 // pdfjs-dist en Node (legacy)
 async function getPdfjs() {
   // Import dinámico para evitar problemas de bundling en Next
@@ -146,12 +141,13 @@ function inferType(descUpper: string): MacroVisaParsedTx["type"] {
  */
 async function renderPdfPageToPng(pdfBuffer: Buffer, pageNumber1Based: number, scale = 2.8) {
   const pdfjs = await getPdfjs();
-  const loadingTask = pdfjs.getDocument({ data: pdfBuffer });
+  const loadingTask = pdfjs.getDocument({ data: pdfBuffer, disableWorker: true });
   const pdf = await loadingTask.promise;
 
   const page = await pdf.getPage(pageNumber1Based);
   const viewport = page.getViewport({ scale });
 
+  const { createCanvas } = await import("@napi-rs/canvas");
   const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
   const ctx = canvas.getContext("2d");
 
@@ -193,7 +189,18 @@ async function ocrTsvWithTesseractCli(pngBuffer: Buffer, lang = "spa", psm = 6):
       proc.stdout.on("data", (d) => (out += String(d)));
       proc.stderr.on("data", (d) => (err += String(d)));
 
-      proc.on("error", reject);
+      proc.on("error", (err) => {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          reject(
+            new Error(
+              "Tesseract no está instalado o no está en el PATH. " +
+                "Instalá tesseract-ocr (y tesseract-ocr-spa) para habilitar el OCR."
+            )
+          );
+          return;
+        }
+        reject(err);
+      });
       proc.on("close", (code) => {
         if (code === 0 && out.trim()) resolve(out);
         else reject(new Error(`tesseract failed (code ${code}): ${err || "no stderr"}`));

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
 
 const items = [
   { href: "/protected/transactions", label: "Transacciones" },
@@ -32,19 +33,23 @@ function shouldPreserve(href: string) {
 export default function AppSidebar() {
   const pathname = usePathname();
   const sp = useSearchParams();
+  const [queryString, setQueryString] = useState("");
 
-  const withPreservedQuery = (href: string) => {
-    if (!shouldPreserve(href)) return href;
-
+  useEffect(() => {
     const usp = new URLSearchParams();
     for (const k of PRESERVE_KEYS) {
       const v = sp.get(k);
       if (v && v.trim() !== "") usp.set(k, v);
     }
+    setQueryString(usp.toString());
+  }, [sp]);
 
-    const qs = usp.toString();
-    return qs ? `${href}?${qs}` : href;
-  };
+  const withPreservedQuery = useMemo(() => {
+    return (href: string) => {
+      if (!shouldPreserve(href)) return href;
+      return queryString ? `${href}?${queryString}` : href;
+    };
+  }, [queryString]);
 
   return (
     <nav className="rounded-xl border border-slate-800 bg-slate-900/70 p-2">
