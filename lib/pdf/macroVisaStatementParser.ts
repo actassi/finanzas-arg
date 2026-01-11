@@ -141,7 +141,8 @@ function inferType(descUpper: string): MacroVisaParsedTx["type"] {
  */
 async function renderPdfPageToPng(pdfBuffer: Buffer, pageNumber1Based: number, scale = 2.8) {
   const pdfjs = await getPdfjs();
-  const loadingTask = pdfjs.getDocument({ data: pdfBuffer, disableWorker: true });
+  const pdfData = Uint8Array.from(pdfBuffer);
+  const loadingTask = pdfjs.getDocument({ data: pdfData, disableWorker: true });
   const pdf = await loadingTask.promise;
 
   const page = await pdf.getPage(pageNumber1Based);
