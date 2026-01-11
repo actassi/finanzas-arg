@@ -26,7 +26,6 @@ async function getPdfjs() {
   );
   pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).toString();
   pdfjs.GlobalWorkerOptions.workerPort = null;
-  (pdfjs as { disableWorker?: boolean }).disableWorker = true;
   return pdfjs;
 }
 
