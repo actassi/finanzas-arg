@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import sharp from "sharp";
@@ -16,15 +17,11 @@ async function getPdfjs() {
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const workerPath = path.join(
-    process.cwd(),
-    "node_modules",
-    "pdfjs-dist",
-    "legacy",
-    "build",
-    "pdf.worker.mjs"
-  );
-  pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).toString();
+  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+    const require = createRequire(import.meta.url);
+    const workerPath = require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).toString();
+  }
   return pdfjs;
 }
 
