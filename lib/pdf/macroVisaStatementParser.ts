@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import sharp from "sharp";
 
@@ -14,7 +15,18 @@ async function getPdfjs() {
   // Import dinámico para evitar problemas de bundling en Next
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore
-  return await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const workerPath = path.join(
+    process.cwd(),
+    "node_modules",
+    "pdfjs-dist",
+    "legacy",
+    "build",
+    "pdf.worker.mjs"
+  );
+  pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).toString();
+  pdfjs.GlobalWorkerOptions.workerPort = null;
+  return pdfjs;
 }
 
 export type MacroVisaParsedTx = {
@@ -141,7 +153,8 @@ function inferType(descUpper: string): MacroVisaParsedTx["type"] {
  */
 async function renderPdfPageToPng(pdfBuffer: Buffer, pageNumber1Based: number, scale = 2.8) {
   const pdfjs = await getPdfjs();
-  const loadingTask = pdfjs.getDocument({ data: pdfBuffer, disableWorker: true });
+  const pdfData = Uint8Array.from(pdfBuffer);
+  const loadingTask = pdfjs.getDocument({ data: pdfData, disableWorker: true });
   const pdf = await loadingTask.promise;
 
   const page = await pdf.getPage(pageNumber1Based);

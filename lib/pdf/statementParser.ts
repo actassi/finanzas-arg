@@ -121,6 +121,7 @@ async function getPdfJs() {
         "pdf.worker.mjs"
       );
       pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).toString();
+      pdfjsLib.GlobalWorkerOptions.workerPort = null;
 
       return pdfjsLib;
     })();
