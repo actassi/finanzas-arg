@@ -3,6 +3,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
+import { sanitizeDbErrorWithDuplicate } from '@/lib/errors';
 
 function cleanTextOrNull(v: unknown): string | null {
   const s = String(v ?? '').trim();
@@ -45,11 +46,13 @@ export async function createCategory(input: {
   });
 
   if (error) {
-    // Unique violation (23505) típico: duplicado por (user_id, name, subcategory)
-    if ((error as any).code === '23505') {
-      throw new Error('Ya existe una categoría con ese nombre y subcategoría.');
-    }
-    throw new Error(error.message);
+    throw new Error(
+      sanitizeDbErrorWithDuplicate(
+        error,
+        'Ya existe una categoría con ese nombre y subcategoría.',
+        'create category'
+      )
+    );
   }
 
   revalidatePath('/protected/categories');
@@ -96,10 +99,13 @@ export async function updateCategory(input: {
     .eq('user_id', user.id);
 
   if (error) {
-    if ((error as any).code === '23505') {
-      throw new Error('Ya existe una categoría con ese nombre y subcategoría.');
-    }
-    throw new Error(error.message);
+    throw new Error(
+      sanitizeDbErrorWithDuplicate(
+        error,
+        'Ya existe una categoría con ese nombre y subcategoría.',
+        'update category'
+      )
+    );
   }
 
   revalidatePath('/protected/categories');
@@ -128,7 +134,13 @@ export async function deleteCategory(input: { id: string }) {
     .eq('user_id', user.id);
 
   if (error) {
-    throw new Error(error.message);
+    throw new Error(
+      sanitizeDbErrorWithDuplicate(
+        error,
+        'No se puede eliminar: hay datos relacionados.',
+        'delete category'
+      )
+    );
   }
 
   revalidatePath('/protected/categories');

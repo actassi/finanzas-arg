@@ -7,6 +7,7 @@ import { redirect } from 'next/navigation';
 import { parseStatementPdf } from '@/lib/pdf/statementParser';
 import { parseMacroVisaStatementPdf } from '@/lib/pdf/macroVisaStatementParser';
 import type { MerchantRule, MatchType, TransactionType } from '@/types/db';
+import { sanitizeDbError } from '@/lib/errors';
 import crypto from 'node:crypto';
 
 /**
@@ -291,8 +292,6 @@ export async function importTransactionsFromPdf(formData: FormData) {
     .select("id");
 
   if (insErr) {
-    console.error("Supabase insert error:", insErr);
-
     // Cleanup best-effort
     try {
       await supabase.from("import_batches").delete().eq("id", importBatchId).eq("user_id", user.id);
@@ -300,14 +299,7 @@ export async function importTransactionsFromPdf(formData: FormData) {
       console.warn("No se pudo limpiar import_batches tras fallo de insert:", e);
     }
 
-    const parts = [
-      insErr.message,
-      (insErr as any).details,
-      (insErr as any).hint,
-      (insErr as any).code ? `code=${(insErr as any).code}` : null,
-    ].filter(Boolean);
-
-    throw new Error(`Error insertando transacciones en la base: ${parts.join(" | ")}`);
+    throw new Error(sanitizeDbError(insErr, "insert transactions"));
   }
 
   revalidatePath("/protected/transactions");
@@ -567,16 +559,7 @@ export async function createTransaction(formData: FormData) {
   });
 
   if (insErr) {
-    console.error("createTransaction insert error:", insErr);
-
-    const parts = [
-      insErr.message,
-      (insErr as any).details,
-      (insErr as any).hint,
-      (insErr as any).code ? `code=${(insErr as any).code}` : null,
-    ].filter(Boolean);
-
-    throw new Error(`Error insertando la transacción: ${parts.join(" | ")}`);
+    throw new Error(sanitizeDbError(insErr, "create transaction"));
   }
 
   // Guardado de regla (si lo usás desde UI)

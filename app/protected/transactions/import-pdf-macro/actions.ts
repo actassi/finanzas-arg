@@ -5,6 +5,7 @@ import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import type { MerchantRule, MatchType, TransactionType } from '@/types/db';
 import type { MacroVisaParsedRow } from '@/lib/pdf/macroVisaOcrClient';
+import { sanitizeDbError } from '@/lib/errors';
 
 /**
  * Devuelve siempre positivo (según tu requerimiento actual).
@@ -214,8 +215,6 @@ export async function importMacroVisaFromRows(input: {
     .select('id');
 
   if (insErr) {
-    console.error('Insert transactions (macro) error:', insErr);
-
     // cleanup best-effort
     try {
       await supabase.from('import_batches').delete().eq('id', importBatchId).eq('user_id', user.id);
@@ -223,14 +222,7 @@ export async function importMacroVisaFromRows(input: {
       console.warn('No se pudo limpiar import_batches tras fallo (macro):', e);
     }
 
-    const parts = [
-      insErr.message,
-      (insErr as any).details,
-      (insErr as any).hint,
-      (insErr as any).code ? `code=${(insErr as any).code}` : null,
-    ].filter(Boolean);
-
-    throw new Error(`Error insertando transacciones (macro): ${parts.join(' | ')}`);
+    throw new Error(sanitizeDbError(insErr, "insert transactions macro"));
   }
 
   revalidatePath('/protected/transactions');

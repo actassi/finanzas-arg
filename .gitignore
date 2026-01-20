@@ -24,6 +24,8 @@
 .DS_Store
 *.pem
 .claude/
+documents/
+install.cmd
 
 # debug
 npm-debug.log*

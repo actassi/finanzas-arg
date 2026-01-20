@@ -36,10 +36,11 @@ export default async function ImportPdfContent(props: {
     .order("name", { ascending: true });
 
   if (accErr) {
+    console.error("Error cargando cuentas:", accErr);
     return (
       <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
         <div className="text-sm text-red-300">
-          Error cargando cuentas: {accErr.message}
+          No se pudieron cargar las cuentas. Intentá recargar la página.
         </div>
       </div>
     );

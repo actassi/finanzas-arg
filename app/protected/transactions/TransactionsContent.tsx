@@ -22,6 +22,18 @@ function monthStartISO(iso: string) {
   return `${iso.slice(0, 7)}-01`;
 }
 
+// Escapa caracteres especiales de PostgREST para búsquedas seguras
+function escapePostgrestLike(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_")
+    .replace(/,/g, "\\,")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)")
+    .replace(/\./g, "\\.");
+}
+
 function getParam(
   sp: Record<string, string | string[] | undefined>,
   key: string
@@ -146,7 +158,7 @@ export default async function TransactionsContent(props: {
   else if (categoryId) txQ = txQ.eq("category_id", categoryId);
 
   if (q) {
-    const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+    const like = `%${escapePostgrestLike(q)}%`;
     txQ = txQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
   }
 
@@ -208,7 +220,7 @@ export default async function TransactionsContent(props: {
   if (type) uncQ = uncQ.eq("type", type);
 
   if (q) {
-    const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+    const like = `%${escapePostgrestLike(q)}%`;
     uncQ = uncQ.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
   }
 

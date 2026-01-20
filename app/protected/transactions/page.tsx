@@ -22,6 +22,24 @@ type ImportBatchRow = {
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
+// Validación de UUID para prevenir SQL injection
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isValidUUID(s: string): boolean {
+  return UUID_REGEX.test(s);
+}
+
+// Escapa caracteres especiales de PostgREST para búsquedas seguras
+function escapePostgrestLike(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")  // escape backslash first
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_")
+    .replace(/,/g, "\\,")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)")
+    .replace(/\./g, "\\.");
+}
+
 function getParam(sp: SearchParams, key: string): string | undefined {
   const v = sp[key];
   return Array.isArray(v) ? v[0] : v;
@@ -179,7 +197,10 @@ export default async function TransactionsPage(props: { searchParams: Promise<Se
 
     const { data: idRows, error: idErr } = await qb;
     if (idErr) console.error("Error buscando batches para presupuesto mensual:", idErr);
-    budgetBatchIds = (idRows ?? []).map((r: any) => String(r.id));
+    // Validar que todos los IDs sean UUIDs válidos para prevenir injection
+    budgetBatchIds = (idRows ?? [])
+      .map((r: any) => String(r.id))
+      .filter((id) => isValidUUID(id));
   }
 
   /**
@@ -221,7 +242,7 @@ export default async function TransactionsPage(props: { searchParams: Promise<Se
     else if (categoryId) qx = qx.eq("category_id", categoryId);
 
     if (q) {
-      const like = `%${q.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+      const like = `%${escapePostgrestLike(q)}%`;
       qx = qx.or(`merchant_name.ilike.${like},description_raw.ilike.${like}`);
     }
 

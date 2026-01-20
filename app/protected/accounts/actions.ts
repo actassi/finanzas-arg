@@ -2,6 +2,7 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { revalidatePath } from "next/cache";
+import { sanitizeDbError } from "@/lib/errors";
 
 export type AccountActionState = {
   ok: boolean;
@@ -91,7 +92,7 @@ export async function createAccount(
     interest_rate,
   });
 
-  if (insErr) return { ok: false, error: insErr.message, message: null };
+  if (insErr) return { ok: false, error: sanitizeDbError(insErr, "create account"), message: null };
 
   revalidatePath("/protected/accounts");
   revalidatePath("/protected/transactions");
@@ -169,7 +170,7 @@ export async function updateAccountInline(input: {
     .eq("id", accountId)
     .eq("user_id", user.id);
 
-  if (updErr) return { ok: false, error: updErr.message, message: null };
+  if (updErr) return { ok: false, error: sanitizeDbError(updErr, "update account"), message: null };
 
   revalidatePath("/protected/accounts");
   revalidatePath("/protected/transactions");
@@ -212,7 +213,7 @@ export async function deleteAccountIfEmpty(accountIdRaw: string): Promise<Accoun
     .eq("user_id", user.id)
     .eq("account_id", accountId);
 
-  if (cErr) return { ok: false, error: cErr.message, message: null };
+  if (cErr) return { ok: false, error: sanitizeDbError(cErr, "count transactions"), message: null };
 
   if ((count ?? 0) > 0) {
     return {
@@ -223,7 +224,7 @@ export async function deleteAccountIfEmpty(accountIdRaw: string): Promise<Accoun
   }
 
   const { error: delErr } = await supabase.from("accounts").delete().eq("id", accountId).eq("user_id", user.id);
-  if (delErr) return { ok: false, error: delErr.message, message: null };
+  if (delErr) return { ok: false, error: sanitizeDbError(delErr, "delete account"), message: null };
 
   revalidatePath("/protected/accounts");
   revalidatePath("/protected/transactions");
