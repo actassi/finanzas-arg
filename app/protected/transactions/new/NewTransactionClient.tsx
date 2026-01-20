@@ -31,12 +31,20 @@ export default function NewTransactionClient({
 
   const [formState, setFormState] = useState({
     account_id: accounts[0]?.id ?? '',
-    date: new Date().toISOString().slice(0, 10), // hoy
-    due_date: '', // ✅ NUEVO (opcional)
+    date: '', // se setea en useEffect para evitar hydration mismatch
+    due_date: '',
     description_raw: '',
     amount: '',
     type: 'expense',
   });
+
+  // Setear fecha de hoy después del mount para evitar hydration mismatch
+  useEffect(() => {
+    setFormState((s) => ({
+      ...s,
+      date: new Date().toISOString().slice(0, 10),
+    }));
+  }, []);
 
   const [suggestedMerchant, setSuggestedMerchant] = useState<string | null>(null);
   const [suggestedCategoryId, setSuggestedCategoryId] = useState<string | null>(null);

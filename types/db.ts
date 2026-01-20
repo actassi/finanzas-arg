@@ -63,7 +63,12 @@ export interface Transaction {
   type: TransactionType;
   import_batch_id: string | null;
   created_at: string;
+  receipt?: string | null;
+  installment_number?: number | null;
+  installments_total?: number | null;
 }
+
+export type TransactionRow = Transaction;
 
 export interface Debt {
   id: string;

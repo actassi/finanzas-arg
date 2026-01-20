@@ -4,26 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Save } from "lucide-react";
 
-import type { Account, Category, TransactionType } from "@/types/db";
+import type { Account, Category, TransactionRow } from "@/types/db";
 import { updateTransactionInline } from "./actions";
-
-type TxRow = {
-  id: string;
-  user_id: string;
-  account_id: string;
-  date: string;
-  description_raw: string;
-  merchant_name: string | null;
-  category_id: string | null;
-  amount: number;
-  type: TransactionType;
-  import_batch_id: string | null;
-  created_at: string;
-
-  receipt?: string | null;
-  installment_number?: number | null;
-  installments_total?: number | null;
-};
 
 type Draft = {
   merchant_name: string;
@@ -45,7 +27,7 @@ function formatMoneyARS(n: number, currency = "ARS") {
 }
 
 export default function TransactionsTableClient(props: {
-  rows: TxRow[];
+  rows: TransactionRow[];
   accounts: Account[];
   categories: Category[];
 }) {

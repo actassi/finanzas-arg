@@ -84,14 +84,28 @@ function stripAccents(s: string) {
 }
 
 function toISODateFromSpanish(d: string, month: string, yy: string): string | null {
-  const dd = String(d).padStart(2, "0");
+  const dayNum = Number(d);
+  // Validar que el día sea razonable (1-31)
+  if (!Number.isFinite(dayNum) || dayNum < 1 || dayNum > 31) return null;
+
+  const dd = String(dayNum).padStart(2, "0");
   const mKey = stripAccents(month.trim().toLowerCase());
   const mm = MONTHS_MAP[mKey];
   if (!mm) return null;
 
   const y2 = Number(yy);
+  // Validar que el año sea razonable
+  if (!Number.isFinite(y2) || y2 < 0 || y2 > 99) return null;
+
   // Regla simple: 00-69 -> 2000-2069, 70-99 -> 1970-1999 (ajustá si te hiciera falta)
   const yyyy = y2 <= 69 ? 2000 + y2 : 1900 + y2;
+
+  // Validar que la fecha sea válida
+  const testDate = new Date(yyyy, Number(mm) - 1, dayNum);
+  if (testDate.getMonth() !== Number(mm) - 1 || testDate.getDate() !== dayNum) {
+    return null; // Fecha inválida (ej: 31 de febrero)
+  }
+
   return `${yyyy}-${mm}-${dd}`;
 }
 
@@ -182,6 +196,11 @@ async function ocrTsvWithTesseractCli(pngBuffer: Buffer, lang = "spa", psm = 6):
   const inPath = path.join(tmpDir, `macrovisa-${randomUUID()}.png`);
   await fs.writeFile(inPath, pngBuffer);
 
+  // Windows: usar ruta completa si tesseract no está en PATH
+  const tesseractCmd = process.platform === "win32"
+    ? "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+    : "tesseract";
+
   try {
     const args = [
       inPath,
@@ -194,7 +213,7 @@ async function ocrTsvWithTesseractCli(pngBuffer: Buffer, lang = "spa", psm = 6):
     ];
 
     const tsv = await new Promise<string>((resolve, reject) => {
-      const proc = spawn("tesseract", args, { stdio: ["ignore", "pipe", "pipe"] });
+      const proc = spawn(tesseractCmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
       let out = "";
       let err = "";
@@ -204,12 +223,10 @@ async function ocrTsvWithTesseractCli(pngBuffer: Buffer, lang = "spa", psm = 6):
 
       proc.on("error", (err) => {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-          reject(
-            new Error(
-              "Tesseract no está instalado o no está en el PATH. " +
-                "Instalá tesseract-ocr (y tesseract-ocr-spa) para habilitar el OCR."
-            )
-          );
+          const msg = process.platform === "win32"
+            ? `Tesseract no encontrado en "${tesseractCmd}". Instalá Tesseract desde https://github.com/UB-Mannheim/tesseract/wiki`
+            : "Tesseract no está instalado. Instalá tesseract-ocr (y tesseract-ocr-spa).";
+          reject(new Error(msg));
           return;
         }
         reject(err);

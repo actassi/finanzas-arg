@@ -1,26 +1,8 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
-import type { Account, Category, TransactionType } from "@/types/db";
+import type { Account, Category, TransactionRow, TransactionType } from "@/types/db";
 import TransactionsTableClient from "./TransactionsTableClient";
-
-type TxRow = {
-  id: string;
-  user_id: string;
-  account_id: string;
-  date: string; // YYYY-MM-DD
-  description_raw: string;
-  merchant_name: string | null;
-  category_id: string | null;
-  amount: number;
-  type: TransactionType;
-  import_batch_id: string | null;
-  created_at: string;
-
-  receipt?: string | null;
-  installment_number?: number | null;
-  installments_total?: number | null;
-};
 
 function firstDayOfMonthISO(d = new Date()) {
   const x = new Date(d.getFullYear(), d.getMonth(), 1);
@@ -175,7 +157,7 @@ export default async function TransactionsContent(props: {
 
   if (txErr) console.error("Error cargando transactions:", txErr);
 
-  const rows = (txData ?? []) as TxRow[];
+  const rows = (txData ?? []) as TransactionRow[];
   const totalCount = count ?? 0;
   const totalPages = Math.max(Math.ceil(totalCount / per), 1);
 
