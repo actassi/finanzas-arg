@@ -463,12 +463,13 @@ export async function parseMacroVisaStatementPdf(pdfBuffer: Buffer): Promise<Mac
     const iso = toISODateFromSpanish(m[1], m[2], m[3]);
     if (!iso) continue;
 
-    const tail = normalizeSpaces(m[4] ?? "");
+    // Detectar importes por palabras "amount-like"
+    const amountPattern = /^[0-9]{1,3}(\.[0-9]{3})*,[0-9]{2}-?$/;
+    const amountPatternSimple = /^[0-9]+,[0-9]{2}-?$/;
 
-    // Detectar importes por palabras “amount-like” cerca del final / derecha
     const amountTokens = ln.words
       .map((w) => ({ ...w, t: w.text.replace(/\s/g, "") }))
-      .filter((w) => /^[0-9]{1,3}(\.[0-9]{3})*,[0-9]{2}-?$/.test(w.t) || /^[0-9]+,[0-9]{2}-?$/.test(w.t))
+      .filter((w) => amountPattern.test(w.t) || amountPatternSimple.test(w.t))
       .sort((a, b) => a.left - b.left);
 
     let ars: number | null = null;
@@ -478,7 +479,6 @@ export async function parseMacroVisaStatementPdf(pdfBuffer: Buffer): Promise<Mac
       ars = parseMoneyAR(amountTokens[0].t);
     } else if (amountTokens.length >= 2) {
       // Heurística: último token a la derecha suele ser USD si la tabla tiene 2 columnas (ARS + USD)
-      // Si tu layout es distinto, ajustamos este criterio por umbral X.
       const last = amountTokens[amountTokens.length - 1];
       const prev = amountTokens[amountTokens.length - 2];
 
@@ -489,29 +489,57 @@ export async function parseMacroVisaStatementPdf(pdfBuffer: Buffer): Promise<Mac
         usd = parseMoneyAR(last.t);
         ars = parseMoneyAR(prev.t);
       } else {
-        // si no hay columna USD clara, tomamos el último como ARS
         ars = parseMoneyAR(last.t);
       }
     }
 
     if (ars == null && usd == null) {
-      // sin importes detectables: ignorar
       continue;
     }
 
-    // Receipt (comprobante numérico) al inicio del tail
-    // Ej: "0000801 * COMERCIO ..." o "035500 * ..."
-    let receipt: string | null = null;
-    let desc0 = tail;
+    // Crear set de textos de montos para excluirlos de la descripción
+    const amountTexts = new Set(amountTokens.map((w) => w.text));
 
-    const rcp = tail.match(/^(\d{5,8})\s+(.*)$/);
+    // Reconstruir descripción SOLO con palabras que NO son:
+    // - Parte de la fecha (día, mes, año)
+    // - Montos detectados
+    const dateDay = m[1];
+    const dateMonth = m[2].toUpperCase();
+    const dateYear = m[3];
+
+    const descWords = ln.words
+      .filter((w) => {
+        const txt = w.text.trim();
+        const txtUpper = txt.toUpperCase();
+        const txtNorm = w.text.replace(/\s/g, "");
+
+        // Excluir componentes de fecha
+        if (txt === dateDay) return false;
+        if (txtUpper === dateMonth || stripAccents(txtUpper) === stripAccents(dateMonth)) return false;
+        if (txt === dateYear) return false;
+
+        // Excluir montos
+        if (amountTexts.has(txt)) return false;
+        if (amountPattern.test(txtNorm) || amountPatternSimple.test(txtNorm)) return false;
+
+        return true;
+      })
+      .sort((a, b) => a.left - b.left)
+      .map((w) => w.text)
+      .join(" ");
+
+    let desc0 = normalizeSpaces(descWords);
+
+    // Receipt (comprobante numérico) al inicio
+    let receipt: string | null = null;
+    const rcp = desc0.match(/^(\d{5,8})\s+(.*)$/);
     if (rcp) {
       receipt = rcp[1];
       desc0 = rcp[2] ?? "";
     }
 
     // Limpieza de marcadores
-    desc0 = normalizeSpaces(desc0.replace(/^\*\s*/, "")); // "* " inicial
+    desc0 = normalizeSpaces(desc0.replace(/^\*\s*/, ""));
     desc0 = desc0.replace(/\s{2,}/g, " ").trim();
 
     // Cuotas

@@ -4,8 +4,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
-import { parseStatementPdf } from '@/lib/pdf/statementParser';
-import { parseMacroVisaStatementPdf } from '@/lib/pdf/macroVisaStatementParser';
+import { parseStatementPdfAuto } from '@/lib/pdf/statementParser';
 import type { MerchantRule, MatchType, TransactionType } from '@/types/db';
 import { sanitizeDbError } from '@/lib/errors';
 import crypto from 'node:crypto';
@@ -166,8 +165,6 @@ export async function importTransactionsFromPdf(formData: FormData) {
   const periodStart = isoDateOrNull(formData.get("statement_period_start"), "statement_period_start");
   const periodEnd = isoDateOrNull(formData.get("statement_period_end"), "statement_period_end");
 
-  const parserType = String(formData.get("parser_type") ?? "standard").trim();
-
   const ab = await file.arrayBuffer();
   const buffer = Buffer.from(ab);
   const fileHash = sha256Hex(buffer);
@@ -182,24 +179,12 @@ export async function importTransactionsFromPdf(formData: FormData) {
     type?: TransactionType | null;
   };
 
-  let rows: ParsedRow[] = [];
+  // Parser unificado con detección automática texto vs OCR
+  const parseResult = await parseStatementPdfAuto(buffer);
+  const rows: ParsedRow[] = parseResult.transactions;
 
-  if (parserType === "macro_visa_ocr") {
-    const parsed = await parseMacroVisaStatementPdf(buffer);
-    rows = parsed.transactions
-      .map((tx) => ({
-        date: tx.date,
-        description: tx.description,
-        amount: tx.amount_ars,
-        receipt: tx.receipt ?? null,
-        installmentNumber: tx.installment_number ?? null,
-        installmentsTotal: tx.installments_total ?? null,
-        type: tx.type ?? null,
-      }))
-      .filter((tx) => Number.isFinite(tx.amount) && tx.amount !== 0);
-  } else {
-    rows = await parseStatementPdf(buffer);
-  }
+  // Log del parser usado (útil para debugging)
+  console.log(`PDF parseado con: ${parseResult.parserUsed} (${rows.length} transacciones)`)
 
   if (!rows.length) {
     redirect("/protected/transactions/import-pdf?imported=0");

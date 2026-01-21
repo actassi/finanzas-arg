@@ -2,6 +2,10 @@
 import "server-only";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  parseMacroVisaStatementPdf,
+  type MacroVisaParsedTx,
+} from "./macroVisaStatementParser";
 
 export type Tx = {
   date: string; // ISO yyyy-mm-dd
@@ -212,4 +216,73 @@ export async function parseVisaPdf(buffer: Buffer): Promise<Tx[]> {
 // Alias para mantener compatibilidad con tu código existente
 export async function parseStatementPdf(buffer: Buffer): Promise<Tx[]> {
   return parseVisaPdf(buffer);
+}
+
+/**
+ * Resultado del parser unificado con metadata sobre el método usado.
+ */
+export type ParseResult = {
+  transactions: Tx[];
+  parserUsed: "text" | "ocr";
+};
+
+/**
+ * Parser unificado con detección automática.
+ *
+ * Estrategia:
+ * 1. Intenta extraer texto con el parser estándar (pdfjs)
+ * 2. Si obtiene >= MIN_TEXT_TRANSACTIONS, usa esas transacciones
+ * 3. Si obtiene menos, intenta OCR
+ * 4. Devuelve el mejor resultado junto con metadata del parser usado
+ */
+const MIN_TEXT_TRANSACTIONS = 1;
+
+export async function parseStatementPdfAuto(buffer: Buffer): Promise<ParseResult> {
+  // 1) Intentar parser de texto primero (más rápido)
+  let textTransactions: Tx[] = [];
+  try {
+    textTransactions = await parseVisaPdf(buffer);
+  } catch (err) {
+    // Si falla el parser de texto, continuar con OCR
+    console.warn("Parser de texto falló, intentando OCR:", err);
+  }
+
+  // 2) Si el parser de texto obtuvo suficientes transacciones, usarlo
+  if (textTransactions.length >= MIN_TEXT_TRANSACTIONS) {
+    return {
+      transactions: textTransactions,
+      parserUsed: "text",
+    };
+  }
+
+  // 3) Intentar OCR
+  try {
+    const ocrResult = await parseMacroVisaStatementPdf(buffer);
+    const ocrTransactions: Tx[] = ocrResult.transactions
+      .filter((tx) => Number.isFinite(tx.amount_ars) && tx.amount_ars !== 0)
+      .map((tx: MacroVisaParsedTx) => ({
+        date: tx.date,
+        description: tx.description,
+        amount: tx.amount_ars,
+        receipt: tx.receipt ?? null,
+        installmentNumber: tx.installment_number ?? null,
+        installmentsTotal: tx.installments_total ?? null,
+      }));
+
+    // Si OCR obtuvo transacciones, usarlo
+    if (ocrTransactions.length > 0) {
+      return {
+        transactions: ocrTransactions,
+        parserUsed: "ocr",
+      };
+    }
+  } catch (err) {
+    console.warn("Parser OCR falló:", err);
+  }
+
+  // 4) Si ninguno funcionó, devolver vacío con texto como fallback
+  return {
+    transactions: [],
+    parserUsed: "text",
+  };
 }

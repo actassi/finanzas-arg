@@ -89,7 +89,7 @@ export default async function ImportPdfContent(props: {
       <form action={importTransactionsFromPdf} className="space-y-4">
         {/* Bloque: archivo + cuenta + tipo */}
         <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
-          <div className="md:col-span-4">
+          <div className="md:col-span-5">
             <label className="text-xs text-slate-300">Cuenta</label>
             <select
               name="account_id"
@@ -109,21 +109,6 @@ export default async function ImportPdfContent(props: {
           </div>
 
           <div className="md:col-span-3">
-            <label className="text-xs text-slate-300">Formato de resumen</label>
-            <select
-              name="parser_type"
-              defaultValue="standard"
-              className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-emerald-500"
-            >
-              <option value="standard">VISA estándar (texto)</option>
-              <option value="macro_visa_ocr">Macro Visa (OCR)</option>
-            </select>
-            <div className="mt-1 text-[11px] text-slate-400">
-              Si el PDF es escaneado o de Macro, elegí OCR.
-            </div>
-          </div>
-
-          <div className="md:col-span-2">
             <label className="text-xs text-slate-300">Tipo por defecto</label>
             <select
               name="type"
@@ -133,15 +118,15 @@ export default async function ImportPdfContent(props: {
               <option value="expense">expense (gasto)</option>
               <option value="income">income (ingreso)</option>
               <option value="payment">payment (pago)</option>
-              <option value="fee">fee (comisión)</option>
+              <option value="fee">fee (comision)</option>
               <option value="transfer">transfer (transferencia)</option>
             </select>
             <div className="mt-1 text-[11px] text-slate-400">
-              “SU PAGO EN PESOS” se normaliza automáticamente a payment.
+              "SU PAGO EN PESOS" se normaliza automaticamente a payment.
             </div>
           </div>
 
-          <div className="md:col-span-3">
+          <div className="md:col-span-4">
             <label className="text-xs text-slate-300">Archivo PDF</label>
             <input
               name="file"
@@ -151,7 +136,7 @@ export default async function ImportPdfContent(props: {
               className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 file:mr-3 file:rounded-md file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
             />
             <div className="mt-1 text-[11px] text-slate-400">
-              Se calcula SHA-256 para evitar duplicados (si el índice está activo).
+              Detecta automaticamente si es texto o necesita OCR.
             </div>
           </div>
         </div>
