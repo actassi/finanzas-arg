@@ -1,8 +1,9 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import ReportsChart from "./reports-chart";
 import IncomeExpenseChart from "./income-expense-chart";
+import CategoryPieChart from "./category-pie-chart";
+import MerchantPieChart from "./merchant-pie-chart";
 import ReportsFiltersClient from "./ReportsFiltersClient";
 
 type SearchParams = Record<string, string | string[] | undefined>;
@@ -407,24 +408,17 @@ export default async function ReportsPage(props: { searchParams: SearchParams | 
         <IncomeExpenseChart income={kpi.income} expense={Number(kpi.expense) + Number(kpi.fee)} />
       </div>
 
-      {/* Por categoría */}
-      <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4 space-y-3">
-        <div className="flex items-center justify-between flex-wrap gap-2">
-          <h2 className="font-semibold text-slate-100">Egresos por categoría (expense + fee)</h2>
-          <div className="text-xs text-slate-400">Eje X: categoría · Eje Y: importe ARS</div>
-        </div>
-        <ReportsChart data={categoryChartData} />
-      </div>
-
-      {/* Rankings */}
+      {/* Rankings con Pie Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
         <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
           <div className="flex items-center justify-between">
-            <h3 className="font-semibold text-slate-100">Top categorías (expense + fee)</h3>
+            <h3 className="font-semibold text-slate-100">Top categorias (expense + fee)</h3>
             <Link className="text-sm underline text-slate-200" href={buildTxHref(txBaseParams)}>
               Ver transacciones
             </Link>
           </div>
+
+          <CategoryPieChart data={categoryChartData} />
 
           <div className="mt-3 space-y-2">
             {byCatList.map((r) => {
@@ -462,6 +456,14 @@ export default async function ReportsPage(props: { searchParams: SearchParams | 
               Ver transacciones
             </Link>
           </div>
+
+          <MerchantPieChart
+            data={byMerList.map((r) => ({
+              merchant_name: r.merchant_name,
+              amount: r.total_amount,
+              txCount: r.tx_count,
+            }))}
+          />
 
           <div className="mt-3 space-y-2">
             {byMerList.map((r) => {
