@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+
+# Check for sensitive files
+echo "Checking for sensitive files..."
+if git diff --cached --name-only | grep -E '\.(env|env\.local|env\.production|key|pem|p12|pfx)$'; then
+  echo "❌ ERROR: You are trying to commit sensitive files!"
+  echo "Please remove them from staging area with: git reset HEAD <file>"
+  exit 1
+fi
+
+# Run linter only on staged files
+echo "Running linter on staged files..."
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=d | grep -E '\.(ts|tsx|js|jsx)$')
+
+if [ -n "$STAGED_FILES" ]; then
+  npx eslint $STAGED_FILES
+else
+  echo "No TypeScript/JavaScript files to lint"
+fi

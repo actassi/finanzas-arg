@@ -27,6 +27,12 @@
 documents/
 install.cmd
 
+# personal/sensitive files
+resumen.docx
+*.key
+*.p12
+*.pfx
+
 # debug
 npm-debug.log*
 yarn-debug.log*
